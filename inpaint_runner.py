@@ -50,14 +50,14 @@ class DiffusersInpaintingBackend:
         return self.torch_dtype
 
     def load(self):
-        from diffusers import StableDiffusionInpaintPipeline
+        from diffusers import StableDiffusionInpaintPipeline, DiffusionPipeline
 
         device = self._resolve_device()
         torch_dtype = self._resolve_torch_dtype(device)
-        self.pipeline = StableDiffusionInpaintPipeline.from_pretrained(
-            self.model_id,
-            torch_dtype=torch_dtype, variant='fp16',
-            local_files_only=self.local_files_only,
+        # self.pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+        self.pipeline = DiffusionPipeline.from_pretrained(
+            self.model_id, torch_dtype=torch_dtype, variant='fp16',
+            local_files_only=self.local_files_only, safety_checker=None
         )
         self.pipeline = self.pipeline.to(device)
 
@@ -91,7 +91,7 @@ class DiffusersInpaintingBackend:
 
         result = self.pipeline(
             prompt=prompt,
-            negative_prompt=negative_prompt or None,
+            negative_prompt=negative_prompt,
             image=image_pil,
             mask_image=mask_pil,
             height=image.shape[0],
