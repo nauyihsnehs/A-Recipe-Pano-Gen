@@ -8,6 +8,12 @@ from anchored_synthesis import run_anchored_synthesis
 from camera import estimate_or_load_fov
 from inpaint_runner import DiffusersInpaintingBackend
 from mask import compute_missing_mask
+from prompt_generator import (
+    generate_panorama_prompts,
+    load_prompt_json,
+    prompts_to_stage3_args,
+    save_prompt_json,
+)
 
 
 def load_image(path):
@@ -102,14 +108,43 @@ def parse_args():
     parser.add_argument("--top-prompt", default="upper hemisphere, sky or ceiling consistent with the scene")
     parser.add_argument("--bottom-prompt", default="lower hemisphere, ground or floor consistent with the scene")
     parser.add_argument("--negative-prompt", default="text, watermark, logo, signature, person, people, human, face, portrait, frame, border, low quality, words, letters, caption, man, woman, child, crowd, black border, white border, worst quality, chinese text, english text, subtitle, body, hands, panel, blurry, lowres, jpeg artifacts, deformed")
+    parser.add_argument("--prompt-json", default="outputs/stage4/prompts.json", help="Load Stage 4 prompt JSON.")
+    parser.add_argument("--generate-prompts", action="store_true", help="Generate Stage 4 prompts before synthesis.")
+    parser.add_argument("--prompt-output", default="outputs/stage4/prompts.json", help="Generated prompt JSON output path.")
+    parser.add_argument("--vlm-base-url", default="http://127.0.0.1:11435/v1")
+    parser.add_argument("--vlm-model", default="qwen3.6")
+    parser.add_argument("--vlm-api-key", default="ollama")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-steps", type=int, default=40)
     parser.add_argument("--guidance-scale", type=float, default=7.5)
     parser.add_argument("--device", default="auto", help="auto, cuda, or cpu.")
     parser.add_argument("--torch-dtype", default="auto", help="auto, float16, float32, or bfloat16.")
-    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--local-files-only", default=True)
 
     return parser.parse_args()
+
+
+def resolve_prompts(args):
+    if args.generate_prompts:
+        prompts = generate_panorama_prompts(
+            args.input,
+            args.vlm_base_url,
+            args.vlm_model,
+            args.vlm_api_key,
+        )
+        output_path = args.prompt_json or args.prompt_output
+        save_prompt_json(output_path, prompts)
+        print("Generated Stage 4 prompts:", output_path)
+
+        return prompts_to_stage3_args(prompts)
+
+    if args.prompt_json:
+        prompts = load_prompt_json(args.prompt_json)
+        print("Loaded Stage 4 prompts:", args.prompt_json)
+
+        return prompts_to_stage3_args(prompts)
+
+    return args.global_prompt, args.top_prompt, args.bottom_prompt, args.negative_prompt
 
 
 def main():
@@ -117,6 +152,7 @@ def main():
     output_dir = Path(args.output_dir)
     input_image = load_image(args.input)
     input_fov_x, input_fov_y = estimate_or_load_fov(input_image, args.input_fov_x)
+    global_prompt, top_prompt, bottom_prompt, negative_prompt = resolve_prompts(args)
     backend = DiffusersInpaintingBackend(
         args.model_id,
         device=args.device,
@@ -133,10 +169,10 @@ def main():
         input_fov_y,
         (args.pano_width, args.pano_height),
         backend,
-        args.global_prompt,
-        args.top_prompt,
-        args.bottom_prompt,
-        args.negative_prompt,
+        global_prompt,
+        top_prompt,
+        bottom_prompt,
+        negative_prompt,
         seed=args.seed,
         num_steps=args.num_steps,
         guidance_scale=args.guidance_scale,
