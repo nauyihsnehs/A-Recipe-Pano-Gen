@@ -119,7 +119,7 @@ def parse_args():
     parser.add_argument("--guidance-scale", type=float, default=7.5)
     parser.add_argument("--device", default="auto", help="auto, cuda, or cpu.")
     parser.add_argument("--torch-dtype", default="auto", help="auto, float16, float32, or bfloat16.")
-    parser.add_argument("--local-files-only", default=True)
+    parser.add_argument("--local-files-only", action="store_true", default=True)
 
     return parser.parse_args()
 
@@ -138,11 +138,14 @@ def resolve_prompts(args):
 
         return prompts_to_stage3_args(prompts)
 
-    if args.prompt_json:
+    if args.prompt_json and Path(args.prompt_json).exists():
         prompts = load_prompt_json(args.prompt_json)
         print("Loaded Stage 4 prompts:", args.prompt_json)
 
         return prompts_to_stage3_args(prompts)
+
+    if args.prompt_json:
+        print("Prompt JSON not found, using CLI prompts:", args.prompt_json)
 
     return args.global_prompt, args.top_prompt, args.bottom_prompt, args.negative_prompt
 
