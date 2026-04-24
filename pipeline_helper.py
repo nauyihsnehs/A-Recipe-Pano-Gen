@@ -1,0 +1,1535 @@
+import base64
+import io
+import json
+import math
+import mimetypes
+import re
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image
+
+
+DEFAULT_FOV_X = 70.0
+
+PROMPT_FIELDS = [
+    "scene_type",
+    "global_atmosphere_prompt",
+    "sky_or_ceiling_prompt",
+    "ground_or_floor_prompt",
+    "negative_prompt",
+]
+
+DEFAULT_SYSTEM_PROMPT = """
+You generate panorama outpainting prompts from one input image.
+Return only one JSON object. Do not include markdown fences or commentary.
+The JSON object must contain exactly these string fields:
+scene_type, global_atmosphere_prompt, sky_or_ceiling_prompt, ground_or_floor_prompt, negative_prompt.
+scene_type must be one of indoor, outdoor, uncertain.
+""".strip()
+
+DEFAULT_USER_PROMPT = """
+Given the input image, infer the scene type and generate prompts for panorama outpainting.
+
+Return:
+1. A coarse global atmosphere prompt describing the place, lighting, weather/time if visible, materials, and visual style.
+   Do not describe central foreground objects, people, text, or unique objects that should not be repeated.
+2. A prompt for the upper hemisphere.
+   If outdoor, describe sky, clouds, lighting, tree canopy, building tops, or other plausible upper-scene elements.
+   If indoor, describe ceiling, upper walls, lighting fixtures, beams, or upper architectural structures.
+3. A prompt for the lower hemisphere.
+   If outdoor, describe ground, road, grass, terrain, water, or floor-like surfaces.
+   If indoor, describe floor material, lower walls, rugs, or lower furniture boundaries.
+4. A negative prompt listing central objects, people, text, logos, duplicate foreground objects, and artifacts that should not be repeated.
+""".strip()
+
+
+def load_image(path):
+    return np.asarray(Image.open(path).convert("RGB"))
+
+
+def save_image(path, image):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+
+    Image.fromarray(image).save(path)
+
+
+def save_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def load_toml_config(path):
+    path = Path(path)
+
+    if not path.exists():
+        return {}
+
+    text = path.read_text(encoding="utf-8")
+
+    try:
+        import tomllib
+
+        return tomllib.loads(text)
+    except ModuleNotFoundError:
+        return parse_simple_toml(text)
+
+
+def parse_simple_toml(text):
+    config = {}
+    section = None
+
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            if not section:
+                raise ValueError("empty TOML section at line " + str(line_number))
+            config.setdefault(section, {})
+            continue
+
+        if "=" not in line:
+            raise ValueError("invalid TOML line " + str(line_number) + ": " + line)
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = parse_simple_toml_value(value.strip())
+
+        if section is None:
+            config[key] = value
+        else:
+            config.setdefault(section, {})[key] = value
+
+    return config
+
+
+def parse_simple_toml_value(value):
+    if value.startswith('"') and value.endswith('"'):
+        return json.loads(value)
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+
+    try:
+        if any(part in value.lower() for part in [".", "e"]):
+            return float(value)
+
+        return int(value)
+    except ValueError:
+        return value
+
+
+def estimate_or_load_fov(image, fov_x=None):
+    if fov_x is None:
+        fov_x = DEFAULT_FOV_X
+
+    height, width = image.shape[:2]
+    fov_x = float(fov_x)
+
+    if width <= 0 or height <= 0:
+        raise ValueError("image width and height must be positive")
+    if fov_x <= 0.0 or fov_x >= 180.0:
+        raise ValueError("fov_x must be between 0 and 180 degrees")
+
+    fov_x_rad = math.radians(fov_x)
+    focal = (width * 0.5) / math.tan(fov_x_rad * 0.5)
+    fov_y_rad = 2.0 * math.atan((height * 0.5) / focal)
+
+    return fov_x, math.degrees(fov_y_rad)
+
+
+def create_equirectangular_canvas(width, height):
+    width = int(width)
+    height = int(height)
+
+    if width <= 0 or height <= 0:
+        raise ValueError("canvas width and height must be positive")
+    if width != height * 2:
+        raise ValueError("equirectangular canvas must use a 2:1 width:height ratio")
+
+    panorama = np.zeros((height, width, 3), dtype=np.uint8)
+    known_mask = np.zeros((height, width), dtype=np.uint8)
+
+    return panorama, known_mask
+
+
+def paste_projected_view(panorama, known_mask, projected, projection_mask):
+    if panorama.shape[:2] != known_mask.shape:
+        raise ValueError("panorama and known_mask dimensions do not match")
+    if panorama.shape[:2] != projected.shape[:2]:
+        raise ValueError("panorama and projected dimensions do not match")
+    if known_mask.shape != projection_mask.shape:
+        raise ValueError("known_mask and projection_mask dimensions do not match")
+
+    output = panorama.copy()
+    output_mask = np.maximum(known_mask, projection_mask)
+    region = projection_mask > 0
+    output[region] = projected[region]
+
+    return output, output_mask
+
+
+def compute_missing_mask(known_mask):
+    return np.where(known_mask > 0, 0, 255).astype(np.uint8)
+
+
+def compute_inpaint_mask(known_mask):
+    return compute_missing_mask(known_mask)
+
+
+def _rotation_matrix(yaw, pitch):
+    yaw = math.radians(float(yaw))
+    pitch = math.radians(float(pitch))
+
+    cy = math.cos(yaw)
+    sy = math.sin(yaw)
+    cp = math.cos(pitch)
+    sp = math.sin(pitch)
+
+    yaw_matrix = np.array(
+        [
+            [cy, 0.0, sy],
+            [0.0, 1.0, 0.0],
+            [-sy, 0.0, cy],
+        ],
+        dtype=np.float32,
+    )
+    pitch_matrix = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, cp, sp],
+            [0.0, -sp, cp],
+        ],
+        dtype=np.float32,
+    )
+
+    return yaw_matrix @ pitch_matrix
+
+
+def _check_fov(fov_x, fov_y):
+    fov_x = float(fov_x)
+    fov_y = float(fov_y)
+
+    if fov_x <= 0.0 or fov_x >= 180.0:
+        raise ValueError("fov_x must be between 0 and 180 degrees")
+    if fov_y <= 0.0 or fov_y >= 180.0:
+        raise ValueError("fov_y must be between 0 and 180 degrees")
+
+    return fov_x, fov_y
+
+
+def _parse_size(size):
+    if len(size) != 2:
+        raise ValueError("size must be a (width, height) pair")
+
+    width = int(size[0])
+    height = int(size[1])
+
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height must be positive")
+
+    return width, height
+
+
+def _perspective_rays(width, height, fov_x, fov_y):
+    fov_x, fov_y = _check_fov(fov_x, fov_y)
+    tan_x = math.tan(math.radians(fov_x) * 0.5)
+    tan_y = math.tan(math.radians(fov_y) * 0.5)
+
+    x = (np.arange(width, dtype=np.float32) + 0.5) / width
+    y = (np.arange(height, dtype=np.float32) + 0.5) / height
+    x = (x * 2.0 - 1.0) * tan_x
+    y = (y * 2.0 - 1.0) * tan_y
+
+    xv, yv = np.meshgrid(x, y)
+    rays = np.stack([xv, -yv, np.ones_like(xv)], axis=-1)
+    norm = np.linalg.norm(rays, axis=-1, keepdims=True)
+
+    return rays / norm
+
+
+def _equirectangular_rays(width, height):
+    x = (np.arange(width, dtype=np.float32) + 0.5) / width
+    y = (np.arange(height, dtype=np.float32) + 0.5) / height
+
+    theta = x * (2.0 * math.pi) - math.pi
+    latitude = (math.pi * 0.5) - y * math.pi
+
+    theta, latitude = np.meshgrid(theta, latitude)
+    cos_latitude = np.cos(latitude)
+
+    rays = np.stack(
+        [
+            cos_latitude * np.sin(theta),
+            np.sin(latitude),
+            cos_latitude * np.cos(theta),
+        ],
+        axis=-1,
+    )
+
+    return rays.astype(np.float32)
+
+
+def project_perspective_to_equirect(image, fov_x, fov_y, yaw, pitch, pano_size):
+    pano_width, pano_height = _parse_size(pano_size)
+    src_height, src_width = image.shape[:2]
+    fov_x, fov_y = _check_fov(fov_x, fov_y)
+
+    if pano_width != pano_height * 2:
+        raise ValueError("pano_size must use a 2:1 width:height ratio")
+
+    tan_x = math.tan(math.radians(fov_x) * 0.5)
+    tan_y = math.tan(math.radians(fov_y) * 0.5)
+    rotation = _rotation_matrix(yaw, pitch)
+
+    world_rays = _equirectangular_rays(pano_width, pano_height)
+    camera_rays = world_rays @ rotation
+    camera_z = camera_rays[..., 2]
+
+    x_norm = np.zeros_like(camera_z, dtype=np.float32)
+    y_norm = np.zeros_like(camera_z, dtype=np.float32)
+    visible = camera_z > 1e-6
+
+    np.divide(camera_rays[..., 0], camera_z, out=x_norm, where=visible)
+    np.divide(camera_rays[..., 1], camera_z, out=y_norm, where=visible)
+
+    map_x = ((x_norm / tan_x) + 1.0) * (src_width * 0.5) - 0.5
+    map_y = ((-y_norm / tan_y) + 1.0) * (src_height * 0.5) - 0.5
+    valid = (
+        visible
+        & (np.abs(x_norm) <= tan_x)
+        & (np.abs(y_norm) <= tan_y)
+        & (map_x >= 0.0)
+        & (map_x <= src_width - 1)
+        & (map_y >= 0.0)
+        & (map_y <= src_height - 1)
+    )
+
+    map_x = np.where(valid, map_x, 0.0).astype(np.float32)
+    map_y = np.where(valid, map_y, 0.0).astype(np.float32)
+
+    projected = cv2.remap(
+        image,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    projection_mask = np.where(valid, 255, 0).astype(np.uint8)
+
+    projected[projection_mask == 0] = 0
+
+    return projected, projection_mask
+
+
+def project_perspective_mask_to_equirect(mask, fov_x, fov_y, yaw, pitch, pano_size):
+    pano_width, pano_height = _parse_size(pano_size)
+    src_height, src_width = mask.shape[:2]
+    fov_x, fov_y = _check_fov(fov_x, fov_y)
+
+    if pano_width != pano_height * 2:
+        raise ValueError("pano_size must use a 2:1 width:height ratio")
+
+    tan_x = math.tan(math.radians(fov_x) * 0.5)
+    tan_y = math.tan(math.radians(fov_y) * 0.5)
+    rotation = _rotation_matrix(yaw, pitch)
+
+    world_rays = _equirectangular_rays(pano_width, pano_height)
+    camera_rays = world_rays @ rotation
+    camera_z = camera_rays[..., 2]
+
+    x_norm = np.zeros_like(camera_z, dtype=np.float32)
+    y_norm = np.zeros_like(camera_z, dtype=np.float32)
+    visible = camera_z > 1e-6
+
+    np.divide(camera_rays[..., 0], camera_z, out=x_norm, where=visible)
+    np.divide(camera_rays[..., 1], camera_z, out=y_norm, where=visible)
+
+    map_x = ((x_norm / tan_x) + 1.0) * (src_width * 0.5) - 0.5
+    map_y = ((-y_norm / tan_y) + 1.0) * (src_height * 0.5) - 0.5
+    valid = (
+        visible
+        & (np.abs(x_norm) <= tan_x)
+        & (np.abs(y_norm) <= tan_y)
+        & (map_x >= 0.0)
+        & (map_x <= src_width - 1)
+        & (map_y >= 0.0)
+        & (map_y <= src_height - 1)
+    )
+
+    map_x = np.where(valid, map_x, 0.0).astype(np.float32)
+    map_y = np.where(valid, map_y, 0.0).astype(np.float32)
+
+    projected = cv2.remap(
+        mask,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    projection_mask = np.where(valid, 255, 0).astype(np.uint8)
+    projected = np.where((projected > 0) & (projection_mask > 0), 255, 0).astype(np.uint8)
+
+    return projected
+
+
+def render_perspective_from_equirect(panorama, yaw, pitch, fov_x, fov_y, out_size):
+    out_width, out_height = _parse_size(out_size)
+    pano_height, pano_width = panorama.shape[:2]
+    fov_x, fov_y = _check_fov(fov_x, fov_y)
+
+    rays = _perspective_rays(out_width, out_height, fov_x, fov_y)
+    rotation = _rotation_matrix(yaw, pitch)
+    world_rays = rays @ rotation.T
+
+    longitude = np.arctan2(world_rays[..., 0], world_rays[..., 2])
+    latitude = np.arcsin(np.clip(world_rays[..., 1], -1.0, 1.0))
+
+    map_x = ((longitude + math.pi) / (2.0 * math.pi)) * pano_width - 0.5
+    map_y = ((math.pi * 0.5 - latitude) / math.pi) * pano_height - 0.5
+    map_x = np.mod(map_x, pano_width).astype(np.float32)
+    map_y = np.clip(map_y, 0.0, pano_height - 1).astype(np.float32)
+
+    return cv2.remap(
+        panorama,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_WRAP,
+    )
+
+
+def render_perspective_mask_from_equirect(mask, yaw, pitch, fov_x, fov_y, out_size):
+    out_width, out_height = _parse_size(out_size)
+    pano_height, pano_width = mask.shape[:2]
+    fov_x, fov_y = _check_fov(fov_x, fov_y)
+
+    rays = _perspective_rays(out_width, out_height, fov_x, fov_y)
+    rotation = _rotation_matrix(yaw, pitch)
+    world_rays = rays @ rotation.T
+
+    longitude = np.arctan2(world_rays[..., 0], world_rays[..., 2])
+    latitude = np.arcsin(np.clip(world_rays[..., 1], -1.0, 1.0))
+
+    map_x = ((longitude + math.pi) / (2.0 * math.pi)) * pano_width - 0.5
+    map_y = ((math.pi * 0.5 - latitude) / math.pi) * pano_height - 0.5
+    map_x = np.mod(map_x, pano_width).astype(np.float32)
+    map_y = np.clip(map_y, 0.0, pano_height - 1).astype(np.float32)
+
+    return cv2.remap(
+        mask,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_WRAP,
+    )
+
+
+def anchored_view_schedule(middle_fov=85.0, vertical_fov=120.0):
+    views = []
+
+    for yaw in [0, 90, 180, 270]:
+        views.append(
+            {
+                "phase": "top",
+                "yaw": float(yaw),
+                "pitch": 90.0,
+                "fov_x": float(vertical_fov),
+                "fov_y": float(vertical_fov),
+            }
+        )
+
+    for yaw in [0, 90, 180, 270]:
+        views.append(
+            {
+                "phase": "bottom",
+                "yaw": float(yaw),
+                "pitch": -90.0,
+                "fov_x": float(vertical_fov),
+                "fov_y": float(vertical_fov),
+            }
+        )
+
+    for yaw in [0, 45, 90, 135, 180, 225, 270, 315]:
+        views.append(
+            {
+                "phase": "horizontal",
+                "yaw": float(yaw),
+                "pitch": 0.0,
+                "fov_x": float(middle_fov),
+                "fov_y": float(middle_fov),
+            }
+        )
+
+    return views
+
+
+def _to_uint8_image(image):
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+
+    return image
+
+
+def _to_mask_image(mask):
+    return np.where(mask > 0, 255, 0).astype(np.uint8)
+
+
+class DiffusersInpaintingBackend:
+    def __init__(self, model_id, device=None, torch_dtype=None, local_files_only=False):
+        self.model_id = model_id
+        self.device = device
+        self.torch_dtype = torch_dtype
+        self.local_files_only = local_files_only
+        self.pipeline = None
+
+    def _resolve_device(self):
+        import torch
+
+        if self.device and self.device != "auto":
+            return self.device
+        if torch.cuda.is_available():
+            return "cuda"
+
+        return "cpu"
+
+    def _resolve_torch_dtype(self, device):
+        import torch
+
+        if self.torch_dtype is None or self.torch_dtype == "auto":
+            if str(device).startswith("cuda"):
+                return torch.float16
+
+            return torch.float32
+
+        if self.torch_dtype == "float16":
+            return torch.float16
+        if self.torch_dtype == "float32":
+            return torch.float32
+        if self.torch_dtype == "bfloat16":
+            return torch.bfloat16
+
+        return self.torch_dtype
+
+    def load(self):
+        from diffusers import DiffusionPipeline
+
+        device = self._resolve_device()
+        torch_dtype = self._resolve_torch_dtype(device)
+        self.pipeline = DiffusionPipeline.from_pretrained(
+            self.model_id,
+            torch_dtype=torch_dtype,
+            variant="fp16",
+            local_files_only=self.local_files_only,
+            safety_checker=None,
+        )
+        self.pipeline = self.pipeline.to(device)
+
+        if hasattr(self.pipeline, "enable_attention_slicing"):
+            self.pipeline.enable_attention_slicing()
+
+        self.device = device
+
+        return self.pipeline
+
+    def __call__(
+        self,
+        image,
+        mask,
+        prompt,
+        negative_prompt=None,
+        seed=42,
+        num_steps=40,
+        guidance_scale=7.5,
+    ):
+        import torch
+
+        if self.pipeline is None:
+            self.load()
+
+        image = _to_uint8_image(image)
+        mask = _to_mask_image(mask)
+        image_pil = Image.fromarray(image).convert("RGB")
+        mask_pil = Image.fromarray(mask).convert("L")
+        generator = torch.Generator(device=self.device).manual_seed(int(seed))
+
+        result = self.pipeline(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=image_pil,
+            mask_image=mask_pil,
+            height=image.shape[0],
+            width=image.shape[1],
+            num_inference_steps=int(num_steps),
+            guidance_scale=float(guidance_scale),
+            generator=generator,
+        )
+
+        return np.asarray(result.images[0].convert("RGB"))
+
+
+class DiffusersImg2ImgRefinementBackend:
+    def __init__(self, model_id, device=None, torch_dtype=None, local_files_only=False):
+        self.model_id = model_id
+        self.device = device
+        self.torch_dtype = torch_dtype
+        self.local_files_only = local_files_only
+        self.pipeline = None
+
+    def _resolve_device(self):
+        import torch
+
+        if self.device and self.device != "auto":
+            return self.device
+        if torch.cuda.is_available():
+            return "cuda"
+
+        return "cpu"
+
+    def _resolve_torch_dtype(self, device):
+        import torch
+
+        if self.torch_dtype is None or self.torch_dtype == "auto":
+            if str(device).startswith("cuda"):
+                return torch.float16
+
+            return torch.float32
+
+        if self.torch_dtype == "float16":
+            return torch.float16
+        if self.torch_dtype == "float32":
+            return torch.float32
+        if self.torch_dtype == "bfloat16":
+            return torch.bfloat16
+
+        return self.torch_dtype
+
+    def load(self):
+        from diffusers import StableDiffusionImg2ImgPipeline
+
+        device = self._resolve_device()
+        torch_dtype = self._resolve_torch_dtype(device)
+        kwargs = {
+            "torch_dtype": torch_dtype,
+            "local_files_only": self.local_files_only,
+            "safety_checker": None,
+        }
+
+        if str(device).startswith("cuda"):
+            kwargs["variant"] = "fp16"
+
+        self.pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
+            self.model_id,
+            **kwargs,
+        )
+        self.pipeline = self.pipeline.to(device)
+
+        if hasattr(self.pipeline, "enable_attention_slicing"):
+            self.pipeline.enable_attention_slicing()
+
+        self.device = device
+
+        return self.pipeline
+
+    def __call__(
+        self,
+        image,
+        prompt,
+        negative_prompt=None,
+        seed=42,
+        num_steps=30,
+        guidance_scale=7.5,
+        denoise_strength=0.3,
+    ):
+        import torch
+
+        if self.pipeline is None:
+            self.load()
+
+        image = _to_uint8_image(image)
+        image_pil = Image.fromarray(image).convert("RGB")
+        generator = torch.Generator(device=self.device).manual_seed(int(seed))
+        result = self.pipeline(
+            prompt=prompt,
+            negative_prompt=negative_prompt or None,
+            image=image_pil,
+            strength=float(denoise_strength),
+            num_inference_steps=int(num_steps),
+            guidance_scale=float(guidance_scale),
+            generator=generator,
+        )
+
+        return np.asarray(result.images[0].convert("RGB"))
+
+
+def run_inpainting(image, mask, prompt, negative_prompt, seed, backend, num_steps, guidance_scale):
+    return backend(
+        image,
+        mask,
+        prompt,
+        negative_prompt=negative_prompt,
+        seed=seed,
+        num_steps=num_steps,
+        guidance_scale=guidance_scale,
+    )
+
+
+def update_pano_with_view(panorama, known_mask, generated_view, update_mask, yaw, pitch, fov_x, fov_y):
+    if panorama.shape[:2] != known_mask.shape:
+        raise ValueError("panorama and known_mask dimensions do not match")
+    if generated_view.shape[:2] != update_mask.shape:
+        raise ValueError("generated_view and update_mask dimensions do not match")
+
+    pano_size = (panorama.shape[1], panorama.shape[0])
+    projected_view, view_footprint = project_perspective_to_equirect(
+        generated_view,
+        fov_x,
+        fov_y,
+        yaw,
+        pitch,
+        pano_size,
+    )
+    projected_mask = project_perspective_mask_to_equirect(
+        update_mask,
+        fov_x,
+        fov_y,
+        yaw,
+        pitch,
+        pano_size,
+    )
+    projected_update_mask = np.where(
+        (projected_mask > 0) & (view_footprint > 0) & (known_mask == 0),
+        255,
+        0,
+    ).astype(np.uint8)
+
+    region = projected_update_mask > 0
+    projected_update = np.zeros_like(panorama)
+    projected_update[region] = projected_view[region]
+
+    updated_panorama = panorama.copy()
+    updated_known_mask = known_mask.copy()
+    updated_panorama[region] = projected_view[region]
+    updated_known_mask[region] = 255
+
+    return updated_panorama, updated_known_mask, projected_update, projected_update_mask
+
+
+def initialize_anchored_panorama(input_image, input_fov_x, input_fov_y, pano_size):
+    panorama, known_mask = create_equirectangular_canvas(pano_size[0], pano_size[1])
+    front_image, input_mask = project_perspective_to_equirect(
+        input_image,
+        input_fov_x,
+        input_fov_y,
+        0.0,
+        0.0,
+        pano_size,
+    )
+    panorama, known_mask = paste_projected_view(
+        panorama,
+        known_mask,
+        front_image,
+        input_mask,
+    )
+
+    anchor_image, anchor_mask = project_perspective_to_equirect(
+        input_image,
+        input_fov_x,
+        input_fov_y,
+        180.0,
+        0.0,
+        pano_size,
+    )
+    panorama, known_mask = paste_projected_view(
+        panorama,
+        known_mask,
+        anchor_image,
+        anchor_mask,
+    )
+
+    input_mask = np.where(input_mask > 0, 255, 0).astype(np.uint8)
+    anchor_mask = np.where(anchor_mask > 0, 255, 0).astype(np.uint8)
+
+    return panorama, known_mask, input_mask, anchor_mask
+
+
+def remove_backside_anchor(panorama, known_mask, input_mask, anchor_mask):
+    output = panorama.copy()
+    output_mask = known_mask.copy()
+    anchor_only = (anchor_mask > 0) & (input_mask == 0)
+
+    output[anchor_only] = 0
+    output_mask[anchor_only] = 0
+    output_mask[input_mask > 0] = 255
+
+    return output, output_mask
+
+
+def make_masked_view(view, mask):
+    masked = view.copy()
+    masked[mask > 0] = 0
+
+    return masked
+
+
+def prompt_for_view(view, global_prompt, top_prompt, bottom_prompt):
+    phase = view["phase"]
+
+    if phase == "top":
+        return combine_prompts(top_prompt, global_prompt)
+    if phase == "bottom":
+        return combine_prompts(bottom_prompt, global_prompt)
+
+    return global_prompt
+
+
+def combine_prompts(primary, secondary):
+    primary = primary.strip()
+    secondary = secondary.strip()
+
+    if primary and secondary:
+        return primary + ", " + secondary
+    if primary:
+        return primary
+
+    return secondary
+
+
+def run_anchored_step(
+    panorama,
+    known_mask,
+    view,
+    backend,
+    prompt,
+    negative_prompt,
+    seed,
+    num_steps,
+    guidance_scale,
+    view_size,
+):
+    out_size = (view_size, view_size)
+    rendered_view = render_perspective_from_equirect(
+        panorama,
+        view["yaw"],
+        view["pitch"],
+        view["fov_x"],
+        view["fov_y"],
+        out_size,
+    )
+    view_known_mask = render_perspective_mask_from_equirect(
+        known_mask,
+        view["yaw"],
+        view["pitch"],
+        view["fov_x"],
+        view["fov_y"],
+        out_size,
+    )
+    inpaint_mask = compute_inpaint_mask(view_known_mask)
+    masked_view = make_masked_view(rendered_view, inpaint_mask)
+    inpainted_view = run_inpainting(
+        masked_view,
+        inpaint_mask,
+        prompt,
+        negative_prompt,
+        seed,
+        backend,
+        num_steps,
+        guidance_scale,
+    )
+    updated_panorama, updated_known_mask, projected_update, projected_update_mask = update_pano_with_view(
+        panorama,
+        known_mask,
+        inpainted_view,
+        inpaint_mask,
+        view["yaw"],
+        view["pitch"],
+        view["fov_x"],
+        view["fov_y"],
+    )
+
+    debug_images = {
+        "rendered_view": rendered_view,
+        "view_known_mask": view_known_mask,
+        "inpaint_mask": inpaint_mask,
+        "masked_view": masked_view,
+        "inpainted_view": inpainted_view,
+        "projected_update": projected_update,
+        "projected_update_mask": projected_update_mask,
+        "updated_panorama": updated_panorama,
+        "updated_known_mask": updated_known_mask,
+    }
+
+    return updated_panorama, updated_known_mask, debug_images
+
+
+def run_anchored_synthesis(
+    input_image,
+    input_fov_x,
+    input_fov_y,
+    pano_size,
+    backend,
+    global_prompt,
+    top_prompt,
+    bottom_prompt,
+    negative_prompt,
+    seed=42,
+    num_steps=40,
+    guidance_scale=7.5,
+    view_size=1024,
+    middle_fov=85.0,
+    vertical_fov=120.0,
+    debug_writer=None,
+):
+    panorama, known_mask, input_mask, anchor_mask = initialize_anchored_panorama(
+        input_image,
+        input_fov_x,
+        input_fov_y,
+        pano_size,
+    )
+    records = []
+    anchor_removed = False
+    schedule = anchored_view_schedule(middle_fov=middle_fov, vertical_fov=vertical_fov)
+
+    if debug_writer:
+        debug_writer(
+            "initial",
+            {
+                "panorama": panorama,
+                "known_mask": known_mask,
+                "input_mask": input_mask,
+                "anchor_mask": anchor_mask,
+            },
+        )
+
+    for index, view in enumerate(schedule):
+        if view["phase"] == "horizontal" and not anchor_removed:
+            if debug_writer:
+                debug_writer(
+                    "after_vertical",
+                    {
+                        "panorama": panorama,
+                        "known_mask": known_mask,
+                    },
+                )
+
+            panorama, known_mask = remove_backside_anchor(
+                panorama,
+                known_mask,
+                input_mask,
+                anchor_mask,
+            )
+            anchor_removed = True
+
+            if debug_writer:
+                debug_writer(
+                    "anchor_removed",
+                    {
+                        "panorama": panorama,
+                        "known_mask": known_mask,
+                    },
+                )
+
+        known_before = int(np.count_nonzero(known_mask))
+        prompt = prompt_for_view(view, global_prompt, top_prompt, bottom_prompt)
+        panorama, known_mask, debug_images = run_anchored_step(
+            panorama,
+            known_mask,
+            view,
+            backend,
+            prompt,
+            negative_prompt,
+            int(seed) + index,
+            num_steps,
+            guidance_scale,
+            view_size,
+        )
+        known_after = int(np.count_nonzero(known_mask))
+        record = {
+            "index": index,
+            "phase": view["phase"],
+            "yaw": view["yaw"],
+            "pitch": view["pitch"],
+            "fov_x": view["fov_x"],
+            "fov_y": view["fov_y"],
+            "known_before": known_before,
+            "known_after": known_after,
+            "known_added": known_after - known_before,
+            "prompt": prompt,
+        }
+        records.append(record)
+
+        if debug_writer:
+            payload = debug_images.copy()
+            payload["record"] = record
+            debug_writer("step", payload)
+
+    if debug_writer:
+        debug_writer(
+            "final",
+            {
+                "panorama": panorama,
+                "known_mask": known_mask,
+            },
+        )
+
+    return panorama, known_mask, records
+
+
+def _soft_alpha(mask, mask_blur):
+    alpha = np.where(mask > 0, 1.0, 0.0).astype(np.float32)
+
+    if mask_blur and mask_blur > 0:
+        alpha = cv2.GaussianBlur(alpha, (0, 0), float(mask_blur))
+        alpha = np.clip(alpha, 0.0, 1.0)
+
+    return alpha[..., None]
+
+
+def _project_refined_view(panorama, refined_view, refine_mask, view, input_mask):
+    pano_size = (panorama.shape[1], panorama.shape[0])
+    projected_view, footprint = project_perspective_to_equirect(
+        refined_view,
+        view["fov_x"],
+        view["fov_y"],
+        view["yaw"],
+        view["pitch"],
+        pano_size,
+    )
+    projected_mask = project_perspective_mask_to_equirect(
+        refine_mask,
+        view["fov_x"],
+        view["fov_y"],
+        view["yaw"],
+        view["pitch"],
+        pano_size,
+    )
+    projected_update_mask = np.where(
+        (projected_mask > 0) & (footprint > 0) & (input_mask == 0),
+        255,
+        0,
+    ).astype(np.uint8)
+
+    output = panorama.copy()
+    projected_update = np.zeros_like(panorama)
+    region = projected_update_mask > 0
+    output[region] = projected_view[region]
+    projected_update[region] = projected_view[region]
+
+    return output, projected_update, projected_update_mask
+
+
+def refine_panorama(
+    panorama,
+    generated_mask,
+    input_mask,
+    prompt,
+    backend,
+    negative_prompt="",
+    seed=42,
+    num_steps=30,
+    guidance_scale=7.5,
+    denoise_strength=0.3,
+    mask_blur=32,
+    view_size=512,
+    middle_fov=85.0,
+    vertical_fov=120.0,
+    debug_writer=None,
+):
+    refined = panorama.copy()
+    records = []
+    schedule = anchored_view_schedule(middle_fov=middle_fov, vertical_fov=vertical_fov)
+
+    for index, view in enumerate(schedule):
+        out_size = (view_size, view_size)
+        view_generated_mask = render_perspective_mask_from_equirect(
+            generated_mask,
+            view["yaw"],
+            view["pitch"],
+            view["fov_x"],
+            view["fov_y"],
+            out_size,
+        )
+        view_input_mask = render_perspective_mask_from_equirect(
+            input_mask,
+            view["yaw"],
+            view["pitch"],
+            view["fov_x"],
+            view["fov_y"],
+            out_size,
+        )
+        refine_mask = np.where(
+            (view_generated_mask > 0) & (view_input_mask == 0),
+            255,
+            0,
+        ).astype(np.uint8)
+        pixel_count = int(np.count_nonzero(refine_mask))
+        record = {
+            "index": index,
+            "phase": view["phase"],
+            "yaw": view["yaw"],
+            "pitch": view["pitch"],
+            "refine_pixels": pixel_count,
+        }
+
+        if pixel_count == 0:
+            record["skipped"] = True
+            records.append(record)
+            continue
+
+        source_view = render_perspective_from_equirect(
+            refined,
+            view["yaw"],
+            view["pitch"],
+            view["fov_x"],
+            view["fov_y"],
+            out_size,
+        )
+        refined_view = backend(
+            source_view,
+            prompt,
+            negative_prompt=negative_prompt,
+            seed=int(seed) + index,
+            num_steps=num_steps,
+            guidance_scale=guidance_scale,
+            denoise_strength=denoise_strength,
+        )
+        alpha = _soft_alpha(refine_mask, mask_blur)
+        blended_view = (
+            refined_view.astype(np.float32) * alpha
+            + source_view.astype(np.float32) * (1.0 - alpha)
+        ).astype(np.uint8)
+        refined, projected_update, projected_update_mask = _project_refined_view(
+            refined,
+            blended_view,
+            refine_mask,
+            view,
+            input_mask,
+        )
+        record["skipped"] = False
+        record["projected_pixels"] = int(np.count_nonzero(projected_update_mask))
+        records.append(record)
+
+        if debug_writer:
+            debug_writer(
+                "step",
+                {
+                    "record": record,
+                    "source_view": source_view,
+                    "refine_mask": refine_mask,
+                    "refined_view": refined_view,
+                    "blended_view": blended_view,
+                    "projected_update": projected_update,
+                    "projected_update_mask": projected_update_mask,
+                    "updated_panorama": refined,
+                },
+            )
+
+    if debug_writer:
+        debug_writer(
+            "final",
+            {
+                "panorama": refined,
+            },
+        )
+
+    return refined, records
+
+
+def image_to_data_url(image):
+    if isinstance(image, (str, Path)):
+        path = Path(image)
+        mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+        data = path.read_bytes()
+    else:
+        buffer = io.BytesIO()
+        if isinstance(image, Image.Image):
+            pil_image = image.convert("RGB")
+        else:
+            if isinstance(image, np.ndarray):
+                array = image
+            else:
+                array = np.asarray(image)
+            if array.dtype != np.uint8:
+                array = np.clip(array, 0, 255).astype(np.uint8)
+            pil_image = Image.fromarray(array).convert("RGB")
+        pil_image.save(buffer, format="PNG")
+        mime_type = "image/png"
+        data = buffer.getvalue()
+
+    encoded = base64.b64encode(data).decode("ascii")
+
+    return "data:" + mime_type + ";base64," + encoded
+
+
+def extract_json_object(text):
+    text = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("VLM response did not contain a JSON object")
+
+    return json.loads(text[start : end + 1])
+
+
+def validate_prompt_schema(prompts):
+    if not isinstance(prompts, dict):
+        raise ValueError("prompt schema must be a JSON object")
+
+    missing = [field for field in PROMPT_FIELDS if field not in prompts]
+    if missing:
+        raise ValueError("prompt schema missing fields: " + ", ".join(missing))
+
+    normalized = {}
+    for field in PROMPT_FIELDS:
+        value = prompts[field]
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            value = str(value)
+        normalized[field] = value.strip()
+
+    scene_type = normalized["scene_type"].lower()
+    if scene_type not in ["indoor", "outdoor", "uncertain"]:
+        scene_type = "uncertain"
+    normalized["scene_type"] = scene_type
+
+    for field in PROMPT_FIELDS:
+        if field != "negative_prompt" and not normalized[field]:
+            raise ValueError("prompt schema field is empty: " + field)
+
+    return normalized
+
+
+def load_prompt_json(path):
+    path = Path(path)
+
+    return validate_prompt_schema(json.loads(path.read_text(encoding="utf-8")))
+
+
+def save_prompt_json(path, prompts):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prompts = validate_prompt_schema(prompts)
+    path.write_text(json.dumps(prompts, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def prompts_to_stage3_args(prompts):
+    prompts = validate_prompt_schema(prompts)
+
+    return (
+        prompts["global_atmosphere_prompt"],
+        prompts["sky_or_ceiling_prompt"],
+        prompts["ground_or_floor_prompt"],
+        prompts["negative_prompt"],
+    )
+
+
+def _completion_content(response):
+    message = response.choices[0].message
+    content = message.content
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+            elif hasattr(item, "text"):
+                parts.append(item.text)
+
+        return "".join(parts)
+
+    return str(content)
+
+
+def _create_completion(client, model, messages):
+    try:
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+    except Exception as error:
+        status_code = getattr(error, "status_code", None)
+        if status_code != 400 and "BadRequest" not in error.__class__.__name__:
+            raise
+
+    return client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.2,
+    )
+
+
+def generate_panorama_prompts(image, base_url, model, api_key):
+    from openai import OpenAI
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    image_url = image_to_data_url(image)
+    messages = [
+        {
+            "role": "system",
+            "content": DEFAULT_SYSTEM_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": DEFAULT_USER_PROMPT,
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_url,
+                    },
+                },
+            ],
+        },
+    ]
+    response = _create_completion(client, model, messages)
+    content = _completion_content(response)
+    prompts = extract_json_object(content)
+
+    return validate_prompt_schema(prompts)
+
+
+def resolve_prompts(config):
+    paths = config["paths"]
+    prompt_config = config["prompts"]
+    vlm_config = config["vlm"]
+
+    if prompt_config["generate"]:
+        prompts = generate_panorama_prompts(
+            paths["input"],
+            vlm_config["base_url"],
+            vlm_config["model"],
+            vlm_config["api_key"],
+        )
+        save_prompt_json(paths["prompt_output"], prompts)
+        print("Generated Stage 4 prompts:", paths["prompt_output"])
+
+        return prompts_to_stage3_args(prompts)
+
+    if paths["prompt_json"] and Path(paths["prompt_json"]).exists():
+        prompts = load_prompt_json(paths["prompt_json"])
+        print("Loaded Stage 4 prompts:", paths["prompt_json"])
+
+        return prompts_to_stage3_args(prompts)
+
+    if paths["prompt_json"]:
+        print("Prompt JSON not found, using configured prompts:", paths["prompt_json"])
+
+    return (
+        prompt_config["global_prompt"],
+        prompt_config["top_prompt"],
+        prompt_config["bottom_prompt"],
+        prompt_config["negative_prompt"],
+    )
+
+
+def format_yaw(yaw):
+    yaw = int(round(yaw)) % 360
+
+    return str(yaw).zfill(3)
+
+
+def save_stage3_debug_payload(output_dir, event, payload):
+    output_dir = Path(output_dir)
+
+    if event == "initial":
+        save_image(output_dir / "00_initial_front_back_anchor.png", payload["panorama"])
+        save_image(output_dir / "01_initial_known_mask.png", payload["known_mask"])
+        save_image(output_dir / "02_front_input_mask.png", payload["input_mask"])
+        save_image(output_dir / "03_back_anchor_mask.png", payload["anchor_mask"])
+        save_image(output_dir / "04_initial_missing_mask.png", compute_missing_mask(payload["known_mask"]))
+        return
+
+    if event == "after_vertical":
+        save_image(output_dir / "30_after_top_bottom_panorama.png", payload["panorama"])
+        save_image(output_dir / "31_after_top_bottom_known_mask.png", payload["known_mask"])
+        return
+
+    if event == "anchor_removed":
+        save_image(output_dir / "40_anchor_removed_panorama.png", payload["panorama"])
+        save_image(output_dir / "41_anchor_removed_known_mask.png", payload["known_mask"])
+        save_image(output_dir / "42_anchor_removed_missing_mask.png", compute_missing_mask(payload["known_mask"]))
+        return
+
+    if event == "step":
+        record = payload["record"]
+        prefix = (
+            str(record["index"]).zfill(2)
+            + "_"
+            + record["phase"]
+            + "_yaw_"
+            + format_yaw(record["yaw"])
+        )
+        step_dir = output_dir / "steps"
+        save_image(step_dir / (prefix + "_rendered_view.png"), payload["rendered_view"])
+        save_image(step_dir / (prefix + "_view_known_mask.png"), payload["view_known_mask"])
+        save_image(step_dir / (prefix + "_inpaint_mask.png"), payload["inpaint_mask"])
+        save_image(step_dir / (prefix + "_masked_view.png"), payload["masked_view"])
+        save_image(step_dir / (prefix + "_inpainted_view.png"), payload["inpainted_view"])
+        save_image(step_dir / (prefix + "_projected_update.png"), payload["projected_update"])
+        save_image(step_dir / (prefix + "_projected_update_mask.png"), payload["projected_update_mask"])
+        save_image(step_dir / (prefix + "_updated_panorama.png"), payload["updated_panorama"])
+        save_image(step_dir / (prefix + "_updated_known_mask.png"), payload["updated_known_mask"])
+        return
+
+    if event == "final":
+        save_image(output_dir / "90_final_panorama.png", payload["panorama"])
+        save_image(output_dir / "91_final_known_mask.png", payload["known_mask"])
+        save_image(output_dir / "92_final_missing_mask.png", compute_missing_mask(payload["known_mask"]))
+
+
+def save_refinement_debug_payload(output_dir, event, payload):
+    output_dir = Path(output_dir)
+
+    if event == "step":
+        record = payload["record"]
+        prefix = (
+            str(record["index"]).zfill(2)
+            + "_"
+            + record["phase"]
+            + "_yaw_"
+            + format_yaw(record["yaw"])
+        )
+        step_dir = output_dir / "refinement_steps"
+        save_image(step_dir / (prefix + "_source_view.png"), payload["source_view"])
+        save_image(step_dir / (prefix + "_refine_mask.png"), payload["refine_mask"])
+        save_image(step_dir / (prefix + "_refined_view.png"), payload["refined_view"])
+        save_image(step_dir / (prefix + "_blended_view.png"), payload["blended_view"])
+        save_image(step_dir / (prefix + "_projected_update.png"), payload["projected_update"])
+        save_image(step_dir / (prefix + "_projected_update_mask.png"), payload["projected_update_mask"])
+        save_image(step_dir / (prefix + "_updated_panorama.png"), payload["updated_panorama"])
+        return
+
+    if event == "final":
+        save_image(output_dir / "95_refined_panorama.png", payload["panorama"])
+
+
+def run_pipeline(config):
+    paths = config["paths"]
+    panorama_config = config["panorama"]
+    view_config = config["view"]
+    model_config = config["models"]
+    synthesis_config = config["synthesis"]
+    refinement_config = config["refinement"]
+
+    output_path = Path(paths["output"])
+    debug_dir = Path(paths["debug_dir"])
+    local_files_only = not model_config["allow_download"]
+    input_image = load_image(paths["input"])
+    input_fov_x, input_fov_y = estimate_or_load_fov(input_image, panorama_config["input_fov_x"])
+    global_prompt, top_prompt, bottom_prompt, negative_prompt = resolve_prompts(config)
+
+    inpaint_backend = DiffusersInpaintingBackend(
+        model_config["inpaint_model_id"],
+        device=model_config["device"],
+        torch_dtype=model_config["torch_dtype"],
+        local_files_only=local_files_only,
+    )
+
+    def stage3_debug_writer(event, payload):
+        save_stage3_debug_payload(debug_dir / "anchored", event, payload)
+
+    panorama, known_mask, stage3_records = run_anchored_synthesis(
+        input_image,
+        input_fov_x,
+        input_fov_y,
+        (panorama_config["width"], panorama_config["height"]),
+        inpaint_backend,
+        global_prompt,
+        top_prompt,
+        bottom_prompt,
+        negative_prompt,
+        seed=synthesis_config["seed"],
+        num_steps=synthesis_config["num_steps"],
+        guidance_scale=synthesis_config["guidance_scale"],
+        view_size=view_config["size"],
+        middle_fov=view_config["middle_fov"],
+        vertical_fov=view_config["vertical_fov"],
+        debug_writer=stage3_debug_writer,
+    )
+
+    input_mask = initialize_anchored_panorama(
+        input_image,
+        input_fov_x,
+        input_fov_y,
+        (panorama_config["width"], panorama_config["height"]),
+    )[2]
+    generated_mask = np.where((known_mask > 0) & (input_mask == 0), 255, 0).astype(np.uint8)
+    save_image(debug_dir / "80_generated_mask.png", generated_mask)
+    save_image(debug_dir / "81_input_preserve_mask.png", input_mask)
+    save_image(debug_dir / "82_stage3_panorama.png", panorama)
+    save_image(debug_dir / "83_stage3_known_mask.png", known_mask)
+    save_image(debug_dir / "84_stage3_missing_mask.png", compute_missing_mask(known_mask))
+    save_json(debug_dir / "stage3_records.json", stage3_records)
+
+    final_panorama = panorama
+    refinement_records = []
+
+    if refinement_config["enabled"]:
+        refine_backend = DiffusersImg2ImgRefinementBackend(
+            model_config["refine_model_id"],
+            device=model_config["device"],
+            torch_dtype=model_config["torch_dtype"],
+            local_files_only=local_files_only,
+        )
+
+        def refinement_debug_writer(event, payload):
+            save_refinement_debug_payload(debug_dir, event, payload)
+
+        final_panorama, refinement_records = refine_panorama(
+            panorama,
+            generated_mask,
+            input_mask,
+            global_prompt,
+            refine_backend,
+            negative_prompt=negative_prompt,
+            seed=synthesis_config["seed"] + 1000,
+            num_steps=refinement_config["steps"],
+            guidance_scale=refinement_config["guidance_scale"],
+            denoise_strength=refinement_config["denoise_strength"],
+            mask_blur=refinement_config["mask_blur"],
+            view_size=view_config["size"],
+            middle_fov=view_config["middle_fov"],
+            vertical_fov=view_config["vertical_fov"],
+            debug_writer=refinement_debug_writer,
+        )
+        save_json(debug_dir / "refinement_records.json", refinement_records)
+    else:
+        print("Refinement disabled")
+
+    save_image(output_path, final_panorama)
+    save_image(debug_dir / "99_final_pano.png", final_panorama)
+    print("Final panorama written to", output_path)
+    print("Debug artifacts written to", debug_dir)
+    print("stage3 views:", len(stage3_records))
+    print("refinement records:", len(refinement_records))

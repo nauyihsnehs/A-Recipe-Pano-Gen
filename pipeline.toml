@@ -1,0 +1,47 @@
+[paths]
+input = "inputs/pano_aiypnfgomckrgf.jpg"
+output = "outputs/final/final_pano.png"
+debug_dir = "outputs/final/debug"
+prompt_json = "outputs/stage4/prompts.json"
+prompt_output = "outputs/stage4/prompts.json"
+
+[panorama]
+width = 2048
+height = 1024
+input_fov_x = 70.0
+
+[view]
+size = 512
+middle_fov = 85.0
+vertical_fov = 120.0
+
+[models]
+inpaint_model_id = "stabilityai/stable-diffusion-2-inpainting"
+refine_model_id = "stabilityai/stable-diffusion-2-1-base"
+device = "auto"
+torch_dtype = "auto"
+allow_download = false
+
+[prompts]
+generate = false
+global_prompt = "a coherent panoramic continuation of the scene"
+top_prompt = "upper hemisphere, sky or ceiling consistent with the scene"
+bottom_prompt = "lower hemisphere, ground or floor consistent with the scene"
+negative_prompt = "text, watermark, logo, signature, person, people, human, face, portrait, frame, border, low quality, words, letters, caption, man, woman, child, crowd, black border, white border, worst quality, chinese text, english text, subtitle, body, hands, panel, blurry, lowres, jpeg artifacts, deformed"
+
+[vlm]
+base_url = "http://127.0.0.1:11435/v1"
+model = "qwen3.6"
+api_key = "ollama"
+
+[synthesis]
+seed = 42
+num_steps = 40
+guidance_scale = 7.5
+
+[refinement]
+enabled = true
+steps = 30
+guidance_scale = 7.5
+denoise_strength = 0.3
+mask_blur = 32.0
