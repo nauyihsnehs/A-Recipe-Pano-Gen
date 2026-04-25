@@ -1,5 +1,7 @@
 import argparse
 
+from pipeline_helper import PromptTools
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -18,31 +20,18 @@ def validate_config(config):
         ("models", ["inpaint_model_id", "refine_model_id"]),
         ("vlm", ["base_url", "model", "api_key"]),
         ("prompting", ["mode"]),
-        (
-            "synthesis",
-            [
-                "seed",
-                "num_steps",
-                "guidance_scale",
-                "mask_dilate_kernel",
-                "mask_dilate_iterations",
-                "overlap_blend",
-            ],
-        ),
+        ("synthesis", ["seed", "num_steps", "guidance_scale", "mask_dilate_kernel", "mask_dilate_iterations", "overlap_blend"]),
         ("refinement", ["enabled", "steps", "guidance_scale", "denoise_strength"]),
     ]
 
     for section, keys in required:
         if section not in config:
             raise KeyError("missing config section: " + section)
-
         for key in keys:
             if key not in config[section]:
                 raise KeyError("missing config key: " + section + "." + key)
 
-    prompt_mode = str(config["prompting"]["mode"]).strip().lower()
-    if prompt_mode not in ["directional", "coarse", "caption"]:
-        raise ValueError("invalid prompting.mode: " + prompt_mode)
+    PromptTools.normalize_prompt_mode(config["prompting"]["mode"])
 
 
 def resolve_prompts(config, prompt_tools, debug_dir):
@@ -92,7 +81,6 @@ def main():
         ImageIO,
         OutputPaths,
         PanoramaRefiner,
-        PromptTools,
         TomlConfigLoader,
     )
 

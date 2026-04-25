@@ -59,64 +59,8 @@ PROMPT_MODES = ["directional", "coarse", "caption"]
 class TomlConfigLoader:
     @staticmethod
     def load(path):
-        path = Path(path)
-        text = path.read_text(encoding="utf-8")
-
-        try:
-            import tomllib
-
-            return tomllib.loads(text)
-        except ModuleNotFoundError:
-            return TomlConfigLoader.parse_simple(text)
-
-    @staticmethod
-    def parse_simple(text):
-        config = {}
-        section = None
-
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            line = line.strip()
-
-            if not line or line.startswith("#"):
-                continue
-
-            if line.startswith("[") and line.endswith("]"):
-                section = line[1:-1].strip()
-                if not section:
-                    raise ValueError("empty TOML section at line " + str(line_number))
-                config.setdefault(section, {})
-                continue
-
-            if "=" not in line:
-                raise ValueError("invalid TOML line " + str(line_number) + ": " + line)
-
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = TomlConfigLoader.parse_value(value.strip())
-
-            if section is None:
-                config[key] = value
-            else:
-                config.setdefault(section, {})[key] = value
-
-        return config
-
-    @staticmethod
-    def parse_value(value):
-        if value.startswith('"') and value.endswith('"'):
-            return json.loads(value)
-        if value == "true":
-            return True
-        if value == "false":
-            return False
-
-        try:
-            if any(part in value.lower() for part in [".", "e"]):
-                return float(value)
-
-            return int(value)
-        except ValueError:
-            return value
+        import tomllib
+        return tomllib.load(Path(path))
 
 
 class ImageIO:
@@ -125,14 +69,14 @@ class ImageIO:
         return np.asarray(Image.open(path).convert("RGB"))
 
     @staticmethod
+    def to_uint8(image):
+        return np.clip(image, 0, 255).astype(np.uint8) if image.dtype != np.uint8 else image
+
+    @staticmethod
     def save_image(path, image):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-
-        if image.dtype != np.uint8:
-            image = np.clip(image, 0, 255).astype(np.uint8)
-
-        Image.fromarray(image).save(path)
+        Image.fromarray(ImageIO.to_uint8(image)).save(path)
 
     @staticmethod
     def save_json(path, data):
@@ -160,11 +104,6 @@ class OutputPaths:
         return run_dir, output_path, debug_dir
 
 
-class NullDebugWriter:
-    def __call__(self, event, payload):
-        pass
-
-
 class GeometryTools:
     @staticmethod
     def estimate_fov(image, fov_x):
@@ -172,18 +111,15 @@ class GeometryTools:
             raise ValueError("input_fov_x must be configured")
 
         height, width = image.shape[:2]
-        fov_x = float(fov_x)
-
         if width <= 0 or height <= 0:
             raise ValueError("image width and height must be positive")
-        if fov_x <= 0.0 or fov_x >= 180.0:
-            raise ValueError("fov_x must be between 0 and 180 degrees")
+        fov_x = float(fov_x)
 
         fov_x_rad = math.radians(fov_x)
         focal = (width * 0.5) / math.tan(fov_x_rad * 0.5)
-        fov_y_rad = 2.0 * math.atan((height * 0.5) / focal)
+        fov_y = math.degrees(2.0 * math.atan((height * 0.5) / focal))
 
-        return fov_x, math.degrees(fov_y_rad)
+        return GeometryTools._check_fov(fov_x, fov_y)
 
     @staticmethod
     def create_equirectangular_canvas(width, height):
@@ -459,7 +395,7 @@ class ViewSchedule:
         ]:
             views.append(View(stage="front_back_vertical", phase=phase, yaw=float(yaw), pitch=pitch, fov_x=vertical_fov, fov_y=vertical_fov))
 
-        for yaw in [22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5]:
+        for yaw in np.arange(22.5, 360.0, 45.0):
             views.append(View(stage="horizontal", phase="horizontal", yaw=float(yaw), pitch=0.0, fov_x=float(middle_fov), fov_y=float(middle_fov)))
 
         return views
@@ -518,15 +454,6 @@ class DiffusersBackendBase:
         import torch
         return torch.Generator(device=self.device).manual_seed(int(seed))
 
-    def _ensure_pipeline(self):
-        if self.pipeline is None:
-            self.load()
-
-    def _to_uint8(self, image):
-        if image.dtype != np.uint8:
-            image = np.clip(image, 0, 255).astype(np.uint8)
-        return image
-
 
 class DiffusersInpaintingBackend(DiffusersBackendBase):
     def __init__(self, model_id):
@@ -536,8 +463,8 @@ class DiffusersInpaintingBackend(DiffusersBackendBase):
 
     def __call__(self, image, mask, prompt, negative_prompt=None, seed=42, generator=None, num_steps=40, guidance_scale=7.5):
         import torch
-        self._ensure_pipeline()
-        image = self._to_uint8(image)
+        if self.pipeline is None: self.load()
+        image = ImageIO.to_uint8(image)
         mask = np.clip(mask, 0, 255).astype(np.uint8)
         image_pil = Image.fromarray(image).convert("RGB")
         mask_pil = Image.fromarray(mask).convert("L")
@@ -559,8 +486,8 @@ class DiffusersImg2ImgRefinementBackend(DiffusersBackendBase):
 
     def __call__(self, image, prompt, negative_prompt=None, seed=42, generator=None, num_steps=30, guidance_scale=7.5, denoise_strength=0.3):
         import torch
-        self._ensure_pipeline()
-        image = self._to_uint8(image)
+        if self.pipeline is None: self.load()
+        image = ImageIO.to_uint8(image)
         image_pil = Image.fromarray(image).convert("RGB")
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(int(seed))
@@ -715,15 +642,8 @@ class AnchoredSynthesizer:
 
     @staticmethod
     def combine_prompts(primary, secondary):
-        primary = primary.strip()
-        secondary = secondary.strip()
-
-        if primary and secondary:
-            return primary + ", " + secondary
-        if primary:
-            return primary
-
-        return secondary
+        parts = [p.strip() for p in (primary, secondary) if p.strip()]
+        return ", ".join(parts)
 
     @staticmethod
     def prompt_for_view(view, global_prompt, top_prompt, bottom_prompt):
@@ -733,19 +653,6 @@ class AnchoredSynthesizer:
             return AnchoredSynthesizer.combine_prompts(bottom_prompt, global_prompt)
 
         return global_prompt
-
-    @staticmethod
-    def run_inpainting(image, mask, prompt, negative_prompt, seed, generator, backend, num_steps, guidance_scale):
-        return backend(
-            image,
-            mask,
-            prompt,
-            negative_prompt=negative_prompt,
-            seed=seed,
-            generator=generator,
-            num_steps=num_steps,
-            guidance_scale=guidance_scale,
-        )
 
     @staticmethod
     def run_step(
@@ -777,9 +684,7 @@ class AnchoredSynthesizer:
             raw_inpaint_mask, mask_dilate_kernel, mask_dilate_iterations,
         )
         masked_view = AnchoredSynthesizer.make_masked_view(rendered_view, inpaint_mask)
-        inpainted_view = AnchoredSynthesizer.run_inpainting(
-            masked_view, inpaint_mask, prompt, negative_prompt, seed, generator, backend, num_steps, guidance_scale,
-        )
+        inpainted_view = backend(masked_view, inpaint_mask, prompt, negative_prompt=negative_prompt, seed=seed, generator=generator, num_steps=num_steps, guidance_scale=guidance_scale)
         (
             updated_panorama,
             updated_known_mask,
@@ -831,8 +736,6 @@ class AnchoredSynthesizer:
             vertical_fov,
             debug_writer=None,
     ):
-        if debug_writer is None:
-            debug_writer = NullDebugWriter()
         panorama, known_mask, input_mask, anchor_mask = AnchoredSynthesizer.initialize(
             input_image,
             input_fov_x,
@@ -851,15 +754,16 @@ class AnchoredSynthesizer:
         if hasattr(backend, "make_generator"):
             generator = backend.make_generator(seed)
 
-        debug_writer(
-            "initial",
-            {
-                "panorama": panorama,
-                "known_mask": known_mask,
-                "input_mask": input_mask,
-                "anchor_mask": anchor_mask,
-            },
-        )
+        if debug_writer:
+            debug_writer(
+                "initial",
+                {
+                    "panorama": panorama,
+                    "known_mask": known_mask,
+                    "input_mask": input_mask,
+                    "anchor_mask": anchor_mask,
+                },
+            )
 
         for index, view in enumerate(schedule):
             if view.stage == "horizontal" and not anchor_removed:
@@ -871,10 +775,11 @@ class AnchoredSynthesizer:
                 )
                 anchor_removed = True
 
-                debug_writer(
-                    "after_front_back_vertical",
-                    {
-                        "panorama": panorama,
+                if debug_writer:
+                    debug_writer(
+                        "after_front_back_vertical",
+                        {
+                            "panorama": panorama,
                             "known_mask": known_mask,
                         },
                     )
@@ -902,79 +807,48 @@ class AnchoredSynthesizer:
                 protect_mask,
                 overlap_blend,
             )
-            stitch_mask = np.full(
-                debug_images["inpaint_mask"].shape,
-                255,
-                dtype=np.uint8,
-            )
+            stitch_mask = np.full(debug_images["inpaint_mask"].shape, 255, dtype=np.uint8)
             (
-                stitched_panorama,
-                stitched_known_mask,
-                stitch_update,
-                stitch_update_mask,
-                stitch_blend_mask,
+                stitched_panorama, stitched_known_mask,
+                stitch_update, stitch_update_mask, stitch_blend_mask,
             ) = PanoramaUpdater.update_with_view(
                 stitched_panorama, stitched_known_mask, debug_images["inpainted_view"], stitch_mask,
                 view.yaw, view.pitch, view.fov_x, view.fov_y, overlap_blend=overlap_blend,
             )
             known_after = int(np.count_nonzero(known_mask))
             stitch_after = int(np.count_nonzero(stitched_known_mask))
-            record = {
-                "index": index,
-                "stage": view.stage,
-                "phase": view.phase,
-                "yaw": view.yaw,
-                "pitch": view.pitch,
-                "fov_x": view.fov_x,
-                "fov_y": view.fov_y,
-                "known_before": known_before,
-                "known_after": known_after,
-                "known_added": known_after - known_before,
-                "stitch_before": stitch_before,
-                "stitch_after": stitch_after,
-                "stitch_added": stitch_after - stitch_before,
-                "prompt": prompt,
-            }
+            record = dict(index=index, stage=view.stage, phase=view.phase, yaw=view.yaw, pitch=view.pitch, fov_x=view.fov_x, fov_y=view.fov_y, known_before=known_before, known_after=known_after, known_added=known_after - known_before, stitch_before=stitch_before, stitch_after=stitch_after, stitch_added=stitch_after - stitch_before, prompt=prompt)
             records.append(record)
 
-            debug_images["stitch_update"] = stitch_update
-            debug_images["stitch_update_mask"] = stitch_update_mask
-            debug_images["stitch_blend_mask"] = stitch_blend_mask
-            debug_images["stitched_panorama"] = stitched_panorama
-            debug_images["stitched_known_mask"] = stitched_known_mask
+            debug_images.update(stitch_update=stitch_update, stitch_update_mask=stitch_update_mask, stitch_blend_mask=stitch_blend_mask, stitched_panorama=stitched_panorama, stitched_known_mask=stitched_known_mask)
             payload = debug_images.copy()
             payload["record"] = record
-            debug_writer("step", payload)
+            if debug_writer:
+                debug_writer("step", payload)
 
-            next_view = None
-            if index + 1 < len(schedule):
-                next_view = schedule[index + 1]
-
-            if (
-                    view.stage == "horizontal"
-                    and not horizontal_saved
-                    and (next_view is None or next_view.stage != "horizontal")
-            ):
+            if view.stage == "horizontal" and not horizontal_saved and (index + 1 >= len(schedule) or schedule[index + 1].stage != "horizontal"):
                 horizontal_saved = True
-                debug_writer(
-                    "after_horizontal",
-                    {
-                        "panorama": panorama,
-                        "known_mask": known_mask,
-                        "stitched_panorama": stitched_panorama,
-                        "stitched_known_mask": stitched_known_mask,
-                    },
-                )
+                if debug_writer:
+                    debug_writer(
+                        "after_horizontal",
+                        {
+                            "panorama": panorama,
+                            "known_mask": known_mask,
+                            "stitched_panorama": stitched_panorama,
+                            "stitched_known_mask": stitched_known_mask,
+                        },
+                    )
 
-        debug_writer(
-            "final",
-            {
-                "panorama": stitched_panorama,
-                "known_mask": stitched_known_mask,
-                "context_panorama": panorama,
-                "context_known_mask": known_mask,
-            },
-        )
+        if debug_writer:
+            debug_writer(
+                "final",
+                {
+                    "panorama": stitched_panorama,
+                    "known_mask": stitched_known_mask,
+                    "context_panorama": panorama,
+                    "context_known_mask": known_mask,
+                },
+            )
 
         return stitched_panorama, stitched_known_mask, records
 
@@ -1020,8 +894,6 @@ class PanoramaRefiner:
             vertical_fov,
             debug_writer=None,
     ):
-        if debug_writer is None:
-            debug_writer = NullDebugWriter()
         refined = panorama.copy()
         records = []
         schedule = ViewSchedule.anchored(middle_fov=middle_fov, vertical_fov=vertical_fov)
@@ -1086,26 +958,28 @@ class PanoramaRefiner:
             record["projected_pixels"] = int(np.count_nonzero(projected_update_mask))
             records.append(record)
 
+            if debug_writer:
+                debug_writer(
+                    "step",
+                    {
+                        "record": record,
+                        "source_view": source_view,
+                        "refine_mask": refine_mask,
+                        "refined_view": refined_view,
+                        "blended_view": blended_view,
+                        "projected_update": projected_update,
+                        "projected_update_mask": projected_update_mask,
+                        "updated_panorama": refined,
+                    },
+                )
+
+        if debug_writer:
             debug_writer(
-                "step",
+                "final",
                 {
-                    "record": record,
-                    "source_view": source_view,
-                    "refine_mask": refine_mask,
-                    "refined_view": refined_view,
-                    "blended_view": blended_view,
-                    "projected_update": projected_update,
-                    "projected_update_mask": projected_update_mask,
-                    "updated_panorama": refined,
+                    "panorama": refined,
                 },
             )
-
-        debug_writer(
-            "final",
-            {
-                "panorama": refined,
-            },
-        )
 
         return refined, records
 
@@ -1135,8 +1009,7 @@ class PromptTools:
                     array = image
                 else:
                     array = np.asarray(image)
-                if array.dtype != np.uint8:
-                    array = np.clip(array, 0, 255).astype(np.uint8)
+                array = ImageIO.to_uint8(array)
                 pil_image = Image.fromarray(array).convert("RGB")
             pil_image.save(buffer, format="PNG")
             mime_type = "image/png"
@@ -1235,16 +1108,8 @@ class PromptTools:
         if mode == "directional":
             return prompts
 
-        global_prompt = prompts["global_atmosphere_prompt"]
-        return PromptTools.validate_schema(
-            {
-                "scene_type": prompts["scene_type"],
-                "global_atmosphere_prompt": global_prompt,
-                "sky_or_ceiling_prompt": global_prompt,
-                "ground_or_floor_prompt": global_prompt,
-                "negative_prompt": prompts["negative_prompt"],
-            }
-        )
+        prompts["sky_or_ceiling_prompt"] = prompts["ground_or_floor_prompt"] = prompts["global_atmosphere_prompt"]
+        return prompts
 
     @staticmethod
     def prompts_to_stage3_args(prompts):
@@ -1278,35 +1143,15 @@ class PromptTools:
         return str(content)
 
     @staticmethod
-    def create_completion(client, model, messages, extra_headers=None):
-        kwargs = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2,
-        }
+    def create_completion(client, model, messages, extra_headers=None, json_mode=False):
+        kwargs = dict(model=model, messages=messages, temperature=0.2)
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
-
-        try:
-            request = kwargs.copy()
-            request["response_format"] = {"type": "json_object"}
-
-            return client.chat.completions.create(**request)
-        except Exception:
-            pass
-
-        return client.chat.completions.create(**kwargs)
-
-    @staticmethod
-    def create_text_completion(client, model, messages, extra_headers=None):
-        kwargs = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2,
-        }
-        if extra_headers:
-            kwargs["extra_headers"] = extra_headers
-
+        if json_mode:
+            try:
+                return client.chat.completions.create(**kwargs, response_format={"type": "json_object"})
+            except Exception:
+                pass
         return client.chat.completions.create(**kwargs)
 
     @staticmethod
@@ -1323,95 +1168,40 @@ class PromptTools:
         return headers
 
     @staticmethod
-    def generate_panorama_prompts(image, vlm_config):
+    def _create_openai_client(vlm_config):
         from openai import OpenAI
-
-        kwargs = {
-            "api_key": vlm_config["api_key"],
-        }
+        kwargs = {"api_key": vlm_config["api_key"]}
         if vlm_config.get("base_url"):
             kwargs["base_url"] = vlm_config["base_url"]
+        return OpenAI(**kwargs)
 
-        client = OpenAI(**kwargs)
-        image_url = PromptTools.image_to_data_url(image)
+    @staticmethod
+    def generate_panorama_prompts(image, vlm_config):
+        client = PromptTools._create_openai_client(vlm_config)
         messages = [
-            {
-                "role": "system",
-                "content": DEFAULT_SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": DEFAULT_USER_PROMPT,
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image_url,
-                        },
-                    },
-                ],
-            },
+            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": DEFAULT_USER_PROMPT},
+                {"type": "image_url", "image_url": {"url": PromptTools.image_to_data_url(image)}},
+            ]},
         ]
-        response = PromptTools.create_completion(
-            client,
-            vlm_config["model"],
-            messages,
-            extra_headers=PromptTools.extra_headers(vlm_config),
-        )
-        content = PromptTools.completion_content(response)
-        prompts = PromptTools.extract_json_object(content)
-
-        return PromptTools.validate_schema(prompts)
+        response = PromptTools.create_completion(client, vlm_config["model"], messages, extra_headers=PromptTools.extra_headers(vlm_config), json_mode=True)
+        return PromptTools.validate_schema(PromptTools.extract_json_object(PromptTools.completion_content(response)))
 
     @staticmethod
     def generate_caption_prompt(image, vlm_config):
-        from openai import OpenAI
-
-        kwargs = {
-            "api_key": vlm_config["api_key"],
-        }
-        if vlm_config.get("base_url"):
-            kwargs["base_url"] = vlm_config["base_url"]
-
-        client = OpenAI(**kwargs)
-        image_url = PromptTools.image_to_data_url(image)
+        client = PromptTools._create_openai_client(vlm_config)
         messages = [
-            {
-                "role": "system",
-                "content": DEFAULT_CAPTION_SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": DEFAULT_CAPTION_USER_PROMPT,
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image_url,
-                        },
-                    },
-                ],
-            },
+            {"role": "system", "content": DEFAULT_CAPTION_SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": DEFAULT_CAPTION_USER_PROMPT},
+                {"type": "image_url", "image_url": {"url": PromptTools.image_to_data_url(image)}},
+            ]},
         ]
-        response = PromptTools.create_text_completion(
-            client,
-            vlm_config["model"],
-            messages,
-            extra_headers=PromptTools.extra_headers(vlm_config),
-        )
-        caption = PromptTools.completion_content(response).strip()
-        caption = re.sub(r"^```(?:text)?\s*", "", caption, flags=re.IGNORECASE).strip()
-        caption = re.sub(r"\s*```$", "", caption).strip()
-
+        response = PromptTools.create_completion(client, vlm_config["model"], messages, extra_headers=PromptTools.extra_headers(vlm_config))
+        caption = re.sub(r"^```(?:text)?\s*|\s*```$", "", PromptTools.completion_content(response).strip(), flags=re.IGNORECASE).strip()
         if not caption:
             raise ValueError("caption prompt is empty")
-
         return caption
 
 
@@ -1446,18 +1236,13 @@ class DebugWriter:
     @staticmethod
     def panel_image(image):
         image = np.asarray(image)
-
         if image.ndim == 2:
             image = np.stack([image, image, image], axis=-1)
         elif image.ndim == 3 and image.shape[2] == 1:
             image = np.repeat(image, 3, axis=2)
         elif image.ndim == 3 and image.shape[2] > 3:
             image = image[:, :, :3]
-
-        if image.dtype != np.uint8:
-            image = np.clip(image, 0, 255).astype(np.uint8)
-
-        return image
+        return ImageIO.to_uint8(image)
 
     @staticmethod
     def stitch_panel_size(panels):
@@ -1542,63 +1327,51 @@ class DebugWriter:
 
         ImageIO.save_image(path, canvas)
 
+    STAGE3_EVENTS = {
+        "initial": [
+            ("panorama", "00_initial_front_back_anchor"),
+            ("known_mask", "01_initial_known_mask"),
+            ("input_mask", "02_front_input_mask"),
+            ("anchor_mask", "03_back_anchor_mask"),
+        ],
+        "after_front_back_vertical": [
+            ("panorama", "30_after_front_back_vertical_panorama"),
+            ("known_mask", "31_after_front_back_vertical_known_mask"),
+        ],
+        "after_horizontal": [
+            ("panorama", "50_after_horizontal_panorama"),
+            ("known_mask", "51_after_horizontal_known_mask"),
+        ],
+        "final": [
+            ("panorama", "90_final_panorama"),
+            ("known_mask", "91_final_known_mask"),
+        ],
+    }
+
     @staticmethod
     def save_stage3_payload(output_dir, event, payload):
-        output_dir = Path(output_dir)
-
-        if event == "initial":
-            ImageIO.save_image(output_dir / "00_initial_front_back_anchor.png", payload["panorama"])
-            ImageIO.save_image(output_dir / "01_initial_known_mask.png", payload["known_mask"])
-            ImageIO.save_image(output_dir / "02_front_input_mask.png", payload["input_mask"])
-            ImageIO.save_image(output_dir / "03_back_anchor_mask.png", payload["anchor_mask"])
-            ImageIO.save_image(output_dir / "04_initial_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
-            return
-
-        if event == "after_front_back_vertical":
-            ImageIO.save_image(output_dir / "30_after_front_back_vertical_panorama.png", payload["panorama"])
-            ImageIO.save_image(output_dir / "31_after_front_back_vertical_known_mask.png", payload["known_mask"])
-            ImageIO.save_image(output_dir / "32_after_front_back_vertical_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
-            return
-
-        if event == "after_horizontal":
-            ImageIO.save_image(output_dir / "50_after_horizontal_panorama.png", payload["panorama"])
-            ImageIO.save_image(output_dir / "51_after_horizontal_known_mask.png", payload["known_mask"])
-            ImageIO.save_image(output_dir / "52_after_horizontal_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
-            if "stitched_panorama" in payload:
-                ImageIO.save_image(output_dir / "53_after_horizontal_stitched_panorama.png", payload["stitched_panorama"])
-                ImageIO.save_image(output_dir / "54_after_horizontal_stitched_known_mask.png", payload["stitched_known_mask"])
-            return
-
         if event == "step":
-            record = payload["record"]
             DebugWriter.save_stitch(
-                output_dir / "stitches" / (DebugWriter.step_name(record) + ".png"),
+                output_dir / "stitches" / (DebugWriter.step_name(payload["record"]) + ".png"),
                 payload,
-                [
-                    "rendered_view",
-                    "view_known_mask",
-                    "raw_inpaint_mask",
-                    "inpaint_mask",
-                    "masked_view",
-                    "inpainted_view",
-                    "projected_update",
-                    "projected_update_mask",
-                    "projected_blend_mask",
-                    "updated_panorama",
-                    "updated_known_mask",
-                    "stitch_update",
-                    "stitch_update_mask",
-                    "stitch_blend_mask",
-                    "stitched_panorama",
-                    "stitched_known_mask",
-                ],
+                ["rendered_view", "view_known_mask", "raw_inpaint_mask", "inpaint_mask", "masked_view", "inpainted_view", "projected_update", "projected_update_mask", "projected_blend_mask", "updated_panorama", "updated_known_mask", "stitch_update", "stitch_update_mask", "stitch_blend_mask", "stitched_panorama", "stitched_known_mask"],
             )
             return
 
-        if event == "final":
-            ImageIO.save_image(output_dir / "90_final_panorama.png", payload["panorama"])
-            ImageIO.save_image(output_dir / "91_final_known_mask.png", payload["known_mask"])
-            ImageIO.save_image(output_dir / "92_final_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
+        output_dir = Path(output_dir)
+        for key, name in DebugWriter.STAGE3_EVENTS.get(event, []):
+            if key in payload:
+                ImageIO.save_image(output_dir / f"{name}.png", payload[key])
+
+        missing = event in ("initial", "after_front_back_vertical", "after_horizontal", "final") and "known_mask" in payload
+        if missing:
+            suffix = {"initial": "04", "after_front_back_vertical": "32", "after_horizontal": "52", "final": "92"}[event]
+            ImageIO.save_image(output_dir / f"{suffix}_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
+
+        if event == "after_horizontal" and "stitched_panorama" in payload:
+            ImageIO.save_image(output_dir / "53_after_horizontal_stitched_panorama.png", payload["stitched_panorama"])
+            ImageIO.save_image(output_dir / "54_after_horizontal_stitched_known_mask.png", payload["stitched_known_mask"])
+        elif event == "final":
             if "context_panorama" in payload:
                 ImageIO.save_image(output_dir / "93_context_panorama.png", payload["context_panorama"])
                 ImageIO.save_image(output_dir / "94_context_known_mask.png", payload["context_known_mask"])
