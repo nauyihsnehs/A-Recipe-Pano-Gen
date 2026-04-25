@@ -28,7 +28,7 @@
 | 具备 perspective 到 equirectangular，以及 equirectangular 到 perspective 的几何转换。 | 实现了输入图投影到全景图，以及从全景图渲染 perspective crop。 | `project_perspective_to_equirect`、`render_perspective_from_equirect` |
 | 在给定水平 FoV 后，按等焦距假设推导垂直 FoV。 | `estimate_fov` 用 `fov_x`、图像宽高推导 `fov_y`。 | `GeometryTools.estimate_fov` |
 | anchored synthesis 的主顺序。 | 输入图投影到正面，复制到 yaw 180 作为临时背面 anchor，先生成 front/back top/bottom，删除 anchor，再生成 horizontal views，最后生成 side top/bottom。 | `AnchoredSynthesizer.initialize`、`remove_backside_anchor`、`run` |
-| 默认视角数量和 FoV 与论文 Section 3.1 主 recipe 一致。 | schedule 使用 4 个斜向 top view、4 个斜向 bottom view、8 个 horizontal view；顺序为 front/back vertical、horizontal、side vertical；默认 top/bottom FoV 为 120 度，pitch 为 `+/- vertical_fov / 2`，middle band 为 85 度。 | `ViewSchedule.anchored`、`pipeline.toml` |
+| 默认视角数量和 FoV 与论文 Section 3.1 主 recipe 一致。 | schedule 使用 4 个斜向 top view、4 个斜向 bottom view、8 个 horizontal view；顺序为 front/back vertical、horizontal、side vertical；默认 top/bottom FoV 为 120 度，pitch 为 `+/- 45`，middle band 为 85 度。 | `ViewSchedule.anchored`、`pipeline.toml` |
 | direction-specific prompt 拆分。 | VLM schema 包含 scene type、global atmosphere、sky/ceiling、ground/floor、negative prompt；top/bottom view 会组合区域 prompt 和 global prompt。 | `PromptTools`、`prompt_for_view` |
 | prompt comparison modes。 | 默认使用论文效果最好的 directional prompts，同时支持 `coarse` 和 `caption` 对比模式。 | `[prompting] mode`、`PromptTools.effective_prompts_for_mode` |
 | main synthesis mask edge cleanup。 | raw binary mask 先膨胀，再生成 soft mask；binary mask 保留用于几何与 known-mask 判断，soft mask 传给 Diffusers 并用于 soft masked view。 | `GeometryTools.dilate_mask`、`GeometryTools.blur_mask`、`soft_inpaint_mask` |

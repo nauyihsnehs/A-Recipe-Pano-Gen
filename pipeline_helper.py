@@ -570,7 +570,7 @@ class ViewSchedule:
     def anchored(middle_fov, vertical_fov):
         views = []
         vertical_fov = float(vertical_fov)
-        vertical_pitch = vertical_fov * 0.5
+        vertical_pitch = 45.0
 
         for phase, yaw, pitch in [
             ("top", 0, vertical_pitch),

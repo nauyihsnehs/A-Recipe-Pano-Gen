@@ -142,7 +142,7 @@ view size: 512
 input fov_x: 90.0
 middle fov: 85.0
 vertical fov: 120.0
-top/bottom pitch: +/- vertical_fov / 2
+top/bottom pitch: +/- 45.0
 inpainting model: stabilityai/stable-diffusion-2-inpainting
 refinement model: stabilityai/stable-diffusion-2-1-base
 VLM endpoint: http://127.0.0.1:11435/v1
@@ -181,7 +181,7 @@ Main debug artifacts include:
 Each anchored stitch is named by execution order, phase, yaw, and pitch, for example:
 
 ```text
-debug/anchored/stitches/00_top_yaw_000_pitch_p060.png
+debug/anchored/stitches/00_top_yaw_000_pitch_p045.png
 ```
 
 Anchored synthesis order:
