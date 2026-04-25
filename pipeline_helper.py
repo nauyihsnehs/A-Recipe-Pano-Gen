@@ -42,6 +42,18 @@ Return:
 4. A negative prompt listing central objects, people, text, logos, duplicate foreground objects, and artifacts that should not be repeated.
 """.strip()
 
+DEFAULT_CAPTION_SYSTEM_PROMPT = """
+You write plain image captions for panorama prompt ablation.
+Return only one concise caption. Do not include JSON, markdown fences, or commentary.
+""".strip()
+
+DEFAULT_CAPTION_USER_PROMPT = """
+Describe the input image in one concise caption.
+Include visible scene content, objects, lighting, and style.
+""".strip()
+
+PROMPT_MODES = ["directional", "coarse", "caption"]
+
 
 class TomlConfigLoader:
     @staticmethod
@@ -157,7 +169,7 @@ class ImageArrayTools:
 
     @staticmethod
     def to_mask_image(mask):
-        return np.where(mask > 0, 255, 0).astype(np.uint8)
+        return np.clip(mask, 0, 255).astype(np.uint8)
 
 
 class GeometryTools:
@@ -218,6 +230,37 @@ class GeometryTools:
     @staticmethod
     def compute_inpaint_mask(known_mask):
         return GeometryTools.compute_missing_mask(known_mask)
+
+    @staticmethod
+    def dilate_mask(mask, kernel_size, iterations):
+        mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+        kernel_size = int(kernel_size)
+        iterations = int(iterations)
+
+        if kernel_size <= 0 or iterations <= 0:
+            return mask
+
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+
+        return cv2.dilate(mask, kernel, iterations=iterations)
+
+    @staticmethod
+    def blur_mask(mask, mask_blur):
+        mask = np.clip(mask, 0, 255).astype(np.uint8)
+
+        if mask_blur and float(mask_blur) > 0.0:
+            alpha = mask.astype(np.float32) / 255.0
+            alpha = cv2.GaussianBlur(alpha, (0, 0), float(mask_blur))
+            alpha = np.clip(alpha, 0.0, 1.0)
+            return (alpha * 255.0).astype(np.uint8)
+
+        return mask
 
     @staticmethod
     def _rotation_matrix(yaw, pitch):
@@ -418,6 +461,58 @@ class GeometryTools:
         return projected
 
     @staticmethod
+    def project_perspective_soft_mask_to_equirect(mask, fov_x, fov_y, yaw, pitch, pano_size):
+        pano_width, pano_height = GeometryTools._parse_size(pano_size)
+        src_height, src_width = mask.shape[:2]
+        fov_x, fov_y = GeometryTools._check_fov(fov_x, fov_y)
+
+        if pano_width != pano_height * 2:
+            raise ValueError("pano_size must use a 2:1 width:height ratio")
+
+        tan_x = math.tan(math.radians(fov_x) * 0.5)
+        tan_y = math.tan(math.radians(fov_y) * 0.5)
+        rotation = GeometryTools._rotation_matrix(yaw, pitch)
+
+        world_rays = GeometryTools._equirectangular_rays(pano_width, pano_height)
+        camera_rays = world_rays @ rotation
+        camera_z = camera_rays[..., 2]
+
+        x_norm = np.zeros_like(camera_z, dtype=np.float32)
+        y_norm = np.zeros_like(camera_z, dtype=np.float32)
+        visible = camera_z > 1e-6
+
+        np.divide(camera_rays[..., 0], camera_z, out=x_norm, where=visible)
+        np.divide(camera_rays[..., 1], camera_z, out=y_norm, where=visible)
+
+        map_x = ((x_norm / tan_x) + 1.0) * (src_width * 0.5) - 0.5
+        map_y = ((-y_norm / tan_y) + 1.0) * (src_height * 0.5) - 0.5
+        valid = (
+                visible
+                & (np.abs(x_norm) <= tan_x)
+                & (np.abs(y_norm) <= tan_y)
+                & (map_x >= 0.0)
+                & (map_x <= src_width - 1)
+                & (map_y >= 0.0)
+                & (map_y <= src_height - 1)
+        )
+
+        map_x = np.where(valid, map_x, 0.0).astype(np.float32)
+        map_y = np.where(valid, map_y, 0.0).astype(np.float32)
+
+        projected = cv2.remap(
+            np.clip(mask, 0, 255).astype(np.uint8),
+            map_x,
+            map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        projection_mask = np.where(valid, 255, 0).astype(np.uint8)
+        projected = np.where(projection_mask > 0, projected, 0).astype(np.uint8)
+
+        return projected
+
+    @staticmethod
     def render_perspective_from_equirect(panorama, yaw, pitch, fov_x, fov_y, out_size):
         out_width, out_height = GeometryTools._parse_size(out_size)
         pano_height, pano_width = panorama.shape[:2]
@@ -568,6 +663,11 @@ class DiffusersInpaintingBackend:
 
         return self.pipeline
 
+    def make_generator(self, seed):
+        import torch
+
+        return torch.Generator(device=self.device).manual_seed(int(seed))
+
     def __call__(
             self,
             image,
@@ -575,6 +675,7 @@ class DiffusersInpaintingBackend:
             prompt,
             negative_prompt=None,
             seed=42,
+            generator=None,
             num_steps=40,
             guidance_scale=7.5,
     ):
@@ -587,7 +688,8 @@ class DiffusersInpaintingBackend:
         mask = ImageArrayTools.to_mask_image(mask)
         image_pil = Image.fromarray(image).convert("RGB")
         mask_pil = Image.fromarray(mask).convert("L")
-        generator = torch.Generator(device=self.device).manual_seed(int(seed))
+        if generator is None:
+            generator = torch.Generator(device=self.device).manual_seed(int(seed))
 
         result = self.pipeline(
             prompt=prompt,
@@ -632,12 +734,18 @@ class DiffusersImg2ImgRefinementBackend:
 
         return self.pipeline
 
+    def make_generator(self, seed):
+        import torch
+
+        return torch.Generator(device=self.device).manual_seed(int(seed))
+
     def __call__(
             self,
             image,
             prompt,
             negative_prompt=None,
             seed=42,
+            generator=None,
             num_steps=30,
             guidance_scale=7.5,
             denoise_strength=0.3,
@@ -649,7 +757,8 @@ class DiffusersImg2ImgRefinementBackend:
 
         image = ImageArrayTools.to_uint8_image(image)
         image_pil = Image.fromarray(image).convert("RGB")
-        generator = torch.Generator(device=self.device).manual_seed(int(seed))
+        if generator is None:
+            generator = torch.Generator(device=self.device).manual_seed(int(seed))
         result = self.pipeline(
             prompt=prompt,
             negative_prompt=negative_prompt or None,
@@ -665,7 +774,19 @@ class DiffusersImg2ImgRefinementBackend:
 
 class PanoramaUpdater:
     @staticmethod
-    def update_with_view(panorama, known_mask, generated_view, update_mask, yaw, pitch, fov_x, fov_y):
+    def update_with_view(
+            panorama,
+            known_mask,
+            generated_view,
+            update_mask,
+            yaw,
+            pitch,
+            fov_x,
+            fov_y,
+            soft_update_mask=None,
+            protect_mask=None,
+            overlap_blend=False,
+    ):
         if panorama.shape[:2] != known_mask.shape:
             raise ValueError("panorama and known_mask dimensions do not match")
         if generated_view.shape[:2] != update_mask.shape:
@@ -688,8 +809,28 @@ class PanoramaUpdater:
             pitch,
             pano_size,
         )
+        if soft_update_mask is None:
+            projected_soft_mask = projected_mask
+        else:
+            projected_soft_mask = GeometryTools.project_perspective_soft_mask_to_equirect(
+                soft_update_mask,
+                fov_x,
+                fov_y,
+                yaw,
+                pitch,
+                pano_size,
+            )
+
+        if protect_mask is None:
+            protect_mask = np.zeros_like(known_mask)
+        else:
+            protect_mask = np.where(protect_mask > 0, 255, 0).astype(np.uint8)
+
         projected_update_mask = np.where(
-            (projected_mask > 0) & (view_footprint > 0) & (known_mask == 0),
+            (projected_mask > 0)
+            & (view_footprint > 0)
+            & (known_mask == 0)
+            & (protect_mask == 0),
             255,
             0,
         ).astype(np.uint8)
@@ -703,7 +844,28 @@ class PanoramaUpdater:
         updated_panorama[region] = projected_view[region]
         updated_known_mask[region] = 255
 
-        return updated_panorama, updated_known_mask, projected_update, projected_update_mask
+        projected_blend_mask = np.zeros_like(known_mask)
+        if overlap_blend:
+            projected_blend_mask = np.where(
+                (projected_soft_mask > 0)
+                & (view_footprint > 0)
+                & (known_mask > 0)
+                & (protect_mask == 0),
+                projected_soft_mask,
+                0,
+            ).astype(np.uint8)
+            blend_region = projected_blend_mask > 0
+
+            if np.any(blend_region):
+                alpha = projected_blend_mask.astype(np.float32) / 255.0
+                alpha = alpha[..., None]
+                blended = (
+                        projected_view.astype(np.float32) * alpha
+                        + updated_panorama.astype(np.float32) * (1.0 - alpha)
+                )
+                updated_panorama[blend_region] = np.clip(blended[blend_region], 0, 255).astype(np.uint8)
+
+        return updated_panorama, updated_known_mask, projected_update, projected_update_mask, projected_blend_mask
 
 
 class AnchoredSynthesizer:
@@ -759,10 +921,10 @@ class AnchoredSynthesizer:
 
     @staticmethod
     def make_masked_view(view, mask):
-        masked = view.copy()
-        masked[mask > 0] = 0
+        alpha = np.clip(mask, 0, 255).astype(np.float32) / 255.0
+        masked = view.astype(np.float32) * (1.0 - alpha[..., None])
 
-        return masked
+        return np.clip(masked, 0, 255).astype(np.uint8)
 
     @staticmethod
     def combine_prompts(primary, secondary):
@@ -788,13 +950,14 @@ class AnchoredSynthesizer:
         return global_prompt
 
     @staticmethod
-    def run_inpainting(image, mask, prompt, negative_prompt, seed, backend, num_steps, guidance_scale):
+    def run_inpainting(image, mask, prompt, negative_prompt, seed, generator, backend, num_steps, guidance_scale):
         return backend(
             image,
             mask,
             prompt,
             negative_prompt=negative_prompt,
             seed=seed,
+            generator=generator,
             num_steps=num_steps,
             guidance_scale=guidance_scale,
         )
@@ -808,9 +971,15 @@ class AnchoredSynthesizer:
             prompt,
             negative_prompt,
             seed,
+            generator,
             num_steps,
             guidance_scale,
             view_size,
+            mask_blur,
+            mask_dilate_kernel,
+            mask_dilate_iterations,
+            protect_mask,
+            overlap_blend,
     ):
         out_size = (view_size, view_size)
         rendered_view = GeometryTools.render_perspective_from_equirect(
@@ -829,19 +998,32 @@ class AnchoredSynthesizer:
             view["fov_y"],
             out_size,
         )
-        inpaint_mask = GeometryTools.compute_inpaint_mask(view_known_mask)
-        masked_view = AnchoredSynthesizer.make_masked_view(rendered_view, inpaint_mask)
+        raw_inpaint_mask = GeometryTools.compute_inpaint_mask(view_known_mask)
+        inpaint_mask = GeometryTools.dilate_mask(
+            raw_inpaint_mask,
+            mask_dilate_kernel,
+            mask_dilate_iterations,
+        )
+        soft_inpaint_mask = GeometryTools.blur_mask(inpaint_mask, mask_blur)
+        masked_view = AnchoredSynthesizer.make_masked_view(rendered_view, soft_inpaint_mask)
         inpainted_view = AnchoredSynthesizer.run_inpainting(
             masked_view,
-            inpaint_mask,
+            soft_inpaint_mask,
             prompt,
             negative_prompt,
             seed,
+            generator,
             backend,
             num_steps,
             guidance_scale,
         )
-        updated_panorama, updated_known_mask, projected_update, projected_update_mask = PanoramaUpdater.update_with_view(
+        (
+            updated_panorama,
+            updated_known_mask,
+            projected_update,
+            projected_update_mask,
+            projected_blend_mask,
+        ) = PanoramaUpdater.update_with_view(
             panorama,
             known_mask,
             inpainted_view,
@@ -850,16 +1032,22 @@ class AnchoredSynthesizer:
             view["pitch"],
             view["fov_x"],
             view["fov_y"],
+            soft_update_mask=soft_inpaint_mask,
+            protect_mask=protect_mask,
+            overlap_blend=overlap_blend,
         )
 
         debug_images = {
             "rendered_view": rendered_view,
             "view_known_mask": view_known_mask,
+            "raw_inpaint_mask": raw_inpaint_mask,
             "inpaint_mask": inpaint_mask,
+            "soft_inpaint_mask": soft_inpaint_mask,
             "masked_view": masked_view,
             "inpainted_view": inpainted_view,
             "projected_update": projected_update,
             "projected_update_mask": projected_update_mask,
+            "projected_blend_mask": projected_blend_mask,
             "updated_panorama": updated_panorama,
             "updated_known_mask": updated_known_mask,
         }
@@ -880,6 +1068,10 @@ class AnchoredSynthesizer:
             seed,
             num_steps,
             guidance_scale,
+            mask_blur,
+            mask_dilate_kernel,
+            mask_dilate_iterations,
+            overlap_blend,
             view_size,
             middle_fov,
             vertical_fov,
@@ -894,6 +1086,9 @@ class AnchoredSynthesizer:
         records = []
         anchor_removed = False
         schedule = ViewSchedule.anchored(middle_fov=middle_fov, vertical_fov=vertical_fov)
+        generator = None
+        if hasattr(backend, "make_generator"):
+            generator = backend.make_generator(seed)
 
         if debug_writer:
             debug_writer(
@@ -936,6 +1131,9 @@ class AnchoredSynthesizer:
 
             known_before = int(np.count_nonzero(known_mask))
             prompt = AnchoredSynthesizer.prompt_for_view(view, global_prompt, top_prompt, bottom_prompt)
+            protect_mask = input_mask
+            if not anchor_removed:
+                protect_mask = np.maximum(input_mask, anchor_mask)
             panorama, known_mask, debug_images = AnchoredSynthesizer.run_step(
                 panorama,
                 known_mask,
@@ -943,10 +1141,16 @@ class AnchoredSynthesizer:
                 backend,
                 prompt,
                 negative_prompt,
-                int(seed) + index,
+                int(seed),
+                generator,
                 num_steps,
                 guidance_scale,
                 view_size,
+                mask_blur,
+                mask_dilate_kernel,
+                mask_dilate_iterations,
+                protect_mask,
+                overlap_blend,
             )
             known_after = int(np.count_nonzero(known_mask))
             record = {
@@ -1045,6 +1249,10 @@ class PanoramaRefiner:
         refined = panorama.copy()
         records = []
         schedule = ViewSchedule.anchored(middle_fov=middle_fov, vertical_fov=vertical_fov)
+        generator_seed = int(seed) + 1000
+        generator = None
+        if hasattr(backend, "make_generator"):
+            generator = backend.make_generator(generator_seed)
 
         for index, view in enumerate(schedule):
             out_size = (view_size, view_size)
@@ -1095,7 +1303,8 @@ class PanoramaRefiner:
                 source_view,
                 prompt,
                 negative_prompt=negative_prompt,
-                seed=int(seed) + index,
+                seed=generator_seed,
+                generator=generator,
                 num_steps=num_steps,
                 guidance_scale=guidance_scale,
                 denoise_strength=denoise_strength,
@@ -1143,6 +1352,15 @@ class PanoramaRefiner:
 
 
 class PromptTools:
+    @staticmethod
+    def normalize_prompt_mode(mode):
+        mode = str(mode or "directional").strip().lower()
+
+        if mode not in PROMPT_MODES:
+            raise ValueError("invalid prompting.mode: " + mode)
+
+        return mode
+
     @staticmethod
     def image_to_data_url(image):
         if isinstance(image, (str, Path)):
@@ -1225,6 +1443,51 @@ class PromptTools:
         path.write_text(json.dumps(prompts, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     @staticmethod
+    def save_prompt_payload(path, payload):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = payload.copy()
+        payload["mode"] = PromptTools.normalize_prompt_mode(payload.get("mode", "directional"))
+        if "effective_prompts" not in payload:
+            raise ValueError("prompt payload missing effective_prompts")
+        payload["effective_prompts"] = PromptTools.validate_schema(payload["effective_prompts"])
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def effective_prompts_for_mode(mode, directional_prompts=None, caption_prompt=None):
+        mode = PromptTools.normalize_prompt_mode(mode)
+
+        if mode == "caption":
+            caption_prompt = str(caption_prompt or "").strip()
+            if not caption_prompt:
+                raise ValueError("caption prompt is empty")
+
+            return PromptTools.validate_schema(
+                {
+                    "scene_type": "uncertain",
+                    "global_atmosphere_prompt": caption_prompt,
+                    "sky_or_ceiling_prompt": caption_prompt,
+                    "ground_or_floor_prompt": caption_prompt,
+                    "negative_prompt": "",
+                }
+            )
+
+        prompts = PromptTools.validate_schema(directional_prompts)
+        if mode == "directional":
+            return prompts
+
+        global_prompt = prompts["global_atmosphere_prompt"]
+        return PromptTools.validate_schema(
+            {
+                "scene_type": prompts["scene_type"],
+                "global_atmosphere_prompt": global_prompt,
+                "sky_or_ceiling_prompt": global_prompt,
+                "ground_or_floor_prompt": global_prompt,
+                "negative_prompt": prompts["negative_prompt"],
+            }
+        )
+
+    @staticmethod
     def prompts_to_stage3_args(prompts):
         prompts = PromptTools.validate_schema(prompts)
 
@@ -1272,6 +1535,18 @@ class PromptTools:
             return client.chat.completions.create(**request)
         except Exception:
             pass
+
+        return client.chat.completions.create(**kwargs)
+
+    @staticmethod
+    def create_text_completion(client, model, messages, extra_headers=None):
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.2,
+        }
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         return client.chat.completions.create(**kwargs)
 
@@ -1332,6 +1607,54 @@ class PromptTools:
 
         return PromptTools.validate_schema(prompts)
 
+    @staticmethod
+    def generate_caption_prompt(image, vlm_config):
+        from openai import OpenAI
+
+        kwargs = {
+            "api_key": vlm_config["api_key"],
+        }
+        if vlm_config.get("base_url"):
+            kwargs["base_url"] = vlm_config["base_url"]
+
+        client = OpenAI(**kwargs)
+        image_url = PromptTools.image_to_data_url(image)
+        messages = [
+            {
+                "role": "system",
+                "content": DEFAULT_CAPTION_SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": DEFAULT_CAPTION_USER_PROMPT,
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url,
+                        },
+                    },
+                ],
+            },
+        ]
+        response = PromptTools.create_text_completion(
+            client,
+            vlm_config["model"],
+            messages,
+            extra_headers=PromptTools.extra_headers(vlm_config),
+        )
+        caption = PromptTools.completion_content(response).strip()
+        caption = re.sub(r"^```(?:text)?\s*", "", caption, flags=re.IGNORECASE).strip()
+        caption = re.sub(r"\s*```$", "", caption).strip()
+
+        if not caption:
+            raise ValueError("caption prompt is empty")
+
+        return caption
+
 
 class DebugWriter:
     @staticmethod
@@ -1373,11 +1696,14 @@ class DebugWriter:
             step_dir = output_dir / "steps"
             ImageIO.save_image(step_dir / (prefix + "_rendered_view.png"), payload["rendered_view"])
             ImageIO.save_image(step_dir / (prefix + "_view_known_mask.png"), payload["view_known_mask"])
+            ImageIO.save_image(step_dir / (prefix + "_raw_inpaint_mask.png"), payload["raw_inpaint_mask"])
             ImageIO.save_image(step_dir / (prefix + "_inpaint_mask.png"), payload["inpaint_mask"])
+            ImageIO.save_image(step_dir / (prefix + "_soft_inpaint_mask.png"), payload["soft_inpaint_mask"])
             ImageIO.save_image(step_dir / (prefix + "_masked_view.png"), payload["masked_view"])
             ImageIO.save_image(step_dir / (prefix + "_inpainted_view.png"), payload["inpainted_view"])
             ImageIO.save_image(step_dir / (prefix + "_projected_update.png"), payload["projected_update"])
             ImageIO.save_image(step_dir / (prefix + "_projected_update_mask.png"), payload["projected_update_mask"])
+            ImageIO.save_image(step_dir / (prefix + "_projected_blend_mask.png"), payload["projected_blend_mask"])
             ImageIO.save_image(step_dir / (prefix + "_updated_panorama.png"), payload["updated_panorama"])
             ImageIO.save_image(step_dir / (prefix + "_updated_known_mask.png"), payload["updated_known_mask"])
             return

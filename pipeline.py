@@ -17,7 +17,19 @@ def validate_config(config):
         ("view", ["size", "middle_fov", "vertical_fov"]),
         ("models", ["inpaint_model_id", "refine_model_id"]),
         ("vlm", ["base_url", "model", "api_key"]),
-        ("synthesis", ["seed", "num_steps", "guidance_scale"]),
+        ("prompting", ["mode"]),
+        (
+            "synthesis",
+            [
+                "seed",
+                "num_steps",
+                "guidance_scale",
+                "mask_blur",
+                "mask_dilate_kernel",
+                "mask_dilate_iterations",
+                "overlap_blend",
+            ],
+        ),
         ("refinement", ["enabled", "steps", "guidance_scale", "denoise_strength", "mask_blur"]),
     ]
 
@@ -29,18 +41,42 @@ def validate_config(config):
             if key not in config[section]:
                 raise KeyError("missing config key: " + section + "." + key)
 
+    prompt_mode = str(config["prompting"]["mode"]).strip().lower()
+    if prompt_mode not in ["directional", "coarse", "caption"]:
+        raise ValueError("invalid prompting.mode: " + prompt_mode)
+
 
 def resolve_prompts(config, prompt_tools, debug_dir):
     paths = config["paths"]
     vlm_config = config["vlm"]
+    prompt_mode = prompt_tools.normalize_prompt_mode(config["prompting"]["mode"])
 
-    prompts = prompt_tools.generate_panorama_prompts(
-        paths["input"],
-        vlm_config,
-    )
+    payload = {
+        "mode": prompt_mode,
+    }
+
+    if prompt_mode == "caption":
+        caption_prompt = prompt_tools.generate_caption_prompt(paths["input"], vlm_config)
+        prompts = prompt_tools.effective_prompts_for_mode(
+            prompt_mode,
+            caption_prompt=caption_prompt,
+        )
+        payload["caption_prompt"] = caption_prompt
+    else:
+        directional_prompts = prompt_tools.generate_panorama_prompts(
+            paths["input"],
+            vlm_config,
+        )
+        prompts = prompt_tools.effective_prompts_for_mode(
+            prompt_mode,
+            directional_prompts=directional_prompts,
+        )
+        payload["directional_prompts"] = directional_prompts
+
+    payload["effective_prompts"] = prompts
     prompt_path = debug_dir / "prompts.json"
-    prompt_tools.save_prompts(prompt_path, prompts)
-    print("Generated prompts:", prompt_path)
+    prompt_tools.save_prompt_payload(prompt_path, payload)
+    print("Generated prompts:", prompt_path, "mode:", prompt_mode)
 
     return prompt_tools.prompts_to_stage3_args(prompts)
 
@@ -98,6 +134,10 @@ def main():
         seed=synthesis_config["seed"],
         num_steps=synthesis_config["num_steps"],
         guidance_scale=synthesis_config["guidance_scale"],
+        mask_blur=synthesis_config["mask_blur"],
+        mask_dilate_kernel=synthesis_config["mask_dilate_kernel"],
+        mask_dilate_iterations=synthesis_config["mask_dilate_iterations"],
+        overlap_blend=synthesis_config["overlap_blend"],
         view_size=view_config["size"],
         middle_fov=view_config["middle_fov"],
         vertical_fov=view_config["vertical_fov"],
@@ -136,7 +176,7 @@ def main():
             global_prompt,
             refine_backend,
             negative_prompt=negative_prompt,
-            seed=synthesis_config["seed"] + 1000,
+            seed=synthesis_config["seed"],
             num_steps=refinement_config["steps"],
             guidance_scale=refinement_config["guidance_scale"],
             denoise_strength=refinement_config["denoise_strength"],
