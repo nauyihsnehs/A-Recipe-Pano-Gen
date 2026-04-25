@@ -169,23 +169,39 @@ Main debug artifacts include:
 
 - initial front/back anchor panorama,
 - known masks and missing masks,
-- per-view rendered crops,
-- per-view raw inpainting masks,
-- per-view inpainting masks,
-- per-view soft inpainting masks,
-- masked views,
-- inpainted views,
-- projected panorama updates,
-- projected overlap blend masks,
+- per-view stitch images under `debug/anchored/stitches/`,
 - final stage-3 panorama,
 - generated mask,
 - input preserve mask,
 - final panorama.
 
+Each anchored stitch is named by execution order, phase, yaw, and pitch, for example:
+
+```text
+debug/anchored/stitches/00_top_yaw_000_pitch_p090.png
+```
+
+Anchored stitch panels are written in this order:
+
+```text
+rendered_view, view_known_mask, raw_inpaint_mask,
+inpaint_mask, soft_inpaint_mask, masked_view,
+inpainted_view, projected_update, projected_update_mask,
+projected_blend_mask, updated_panorama, updated_known_mask
+```
+
 When refinement is enabled, per-view refinement artifacts are written under:
 
 ```text
-debug/refinement_steps/
+debug/refinement_stitches/
+```
+
+Refinement stitch panels are written in this order:
+
+```text
+source_view, refine_mask, refined_view,
+blended_view, projected_update, projected_update_mask,
+updated_panorama
 ```
 
 ## Citation

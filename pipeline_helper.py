@@ -1664,6 +1664,126 @@ class DebugWriter:
         return str(yaw).zfill(3)
 
     @staticmethod
+    def format_pitch(pitch):
+        pitch = int(round(pitch))
+        sign = "p"
+        if pitch < 0:
+            sign = "n"
+
+        return sign + str(abs(pitch)).zfill(3)
+
+    @staticmethod
+    def step_name(record):
+        return (
+                str(int(record["index"])).zfill(2)
+                + "_"
+                + record["phase"]
+                + "_yaw_"
+                + DebugWriter.format_yaw(record["yaw"])
+                + "_pitch_"
+                + DebugWriter.format_pitch(record["pitch"])
+        )
+
+    @staticmethod
+    def panel_image(image):
+        image = np.asarray(image)
+
+        if image.ndim == 2:
+            image = np.stack([image, image, image], axis=-1)
+        elif image.ndim == 3 and image.shape[2] == 1:
+            image = np.repeat(image, 3, axis=2)
+        elif image.ndim == 3 and image.shape[2] > 3:
+            image = image[:, :, :3]
+
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+
+        return image
+
+    @staticmethod
+    def stitch_panel_size(panels):
+        square_sizes = []
+
+        for _, image in panels:
+            height, width = image.shape[:2]
+            if width <= 0 or height <= 0:
+                continue
+            aspect = width / float(height)
+            if aspect >= 0.75 and aspect <= 1.35:
+                square_sizes.append(max(width, height))
+
+        if square_sizes:
+            size = max(square_sizes)
+        else:
+            size = 512
+
+        size = max(320, min(size, 768))
+
+        return size, size
+
+    @staticmethod
+    def add_label(image, label):
+        cv2.putText(
+            image,
+            label.replace("_", " "),
+            (8, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    @staticmethod
+    def save_stitch(path, payload, names):
+        panels = []
+
+        for name in names:
+            if name in payload:
+                panels.append((name, DebugWriter.panel_image(payload[name])))
+
+        if not panels:
+            return
+
+        columns = 3
+        label_height = 28
+        padding = 8
+        panel_width, panel_height = DebugWriter.stitch_panel_size(panels)
+        rows = int(math.ceil(len(panels) / float(columns)))
+        tile_height = panel_height + label_height
+        canvas_width = columns * panel_width + (columns + 1) * padding
+        canvas_height = rows * tile_height + (rows + 1) * padding
+        canvas = np.full((canvas_height, canvas_width, 3), 24, dtype=np.uint8)
+
+        for index, item in enumerate(panels):
+            name, image = item
+            row = index // columns
+            column = index % columns
+            left = padding + column * (panel_width + padding)
+            top = padding + row * (tile_height + padding)
+            tile = np.full((tile_height, panel_width, 3), 12, dtype=np.uint8)
+            tile[:label_height, :, :] = 36
+            DebugWriter.add_label(tile, name)
+
+            image_height, image_width = image.shape[:2]
+            scale = min(panel_width / float(image_width), panel_height / float(image_height))
+            resized_width = max(1, int(round(image_width * scale)))
+            resized_height = max(1, int(round(image_height * scale)))
+            interpolation = cv2.INTER_LINEAR
+            if scale < 1.0:
+                interpolation = cv2.INTER_AREA
+            resized = cv2.resize(image, (resized_width, resized_height), interpolation=interpolation)
+            image_left = (panel_width - resized_width) // 2
+            image_top = label_height + (panel_height - resized_height) // 2
+            tile[
+                image_top: image_top + resized_height,
+                image_left: image_left + resized_width,
+            ] = resized
+            canvas[top: top + tile_height, left: left + panel_width] = tile
+
+        ImageIO.save_image(path, canvas)
+
+    @staticmethod
     def save_stage3_payload(output_dir, event, payload):
         output_dir = Path(output_dir)
 
@@ -1688,24 +1808,24 @@ class DebugWriter:
 
         if event == "step":
             record = payload["record"]
-            prefix = (
-                    record["phase"]
-                    + "_yaw_"
-                    + DebugWriter.format_yaw(record["yaw"])
+            DebugWriter.save_stitch(
+                output_dir / "stitches" / (DebugWriter.step_name(record) + ".png"),
+                payload,
+                [
+                    "rendered_view",
+                    "view_known_mask",
+                    "raw_inpaint_mask",
+                    "inpaint_mask",
+                    "soft_inpaint_mask",
+                    "masked_view",
+                    "inpainted_view",
+                    "projected_update",
+                    "projected_update_mask",
+                    "projected_blend_mask",
+                    "updated_panorama",
+                    "updated_known_mask",
+                ],
             )
-            step_dir = output_dir / "steps"
-            ImageIO.save_image(step_dir / (prefix + "_rendered_view.png"), payload["rendered_view"])
-            ImageIO.save_image(step_dir / (prefix + "_view_known_mask.png"), payload["view_known_mask"])
-            ImageIO.save_image(step_dir / (prefix + "_raw_inpaint_mask.png"), payload["raw_inpaint_mask"])
-            ImageIO.save_image(step_dir / (prefix + "_inpaint_mask.png"), payload["inpaint_mask"])
-            ImageIO.save_image(step_dir / (prefix + "_soft_inpaint_mask.png"), payload["soft_inpaint_mask"])
-            ImageIO.save_image(step_dir / (prefix + "_masked_view.png"), payload["masked_view"])
-            ImageIO.save_image(step_dir / (prefix + "_inpainted_view.png"), payload["inpainted_view"])
-            ImageIO.save_image(step_dir / (prefix + "_projected_update.png"), payload["projected_update"])
-            ImageIO.save_image(step_dir / (prefix + "_projected_update_mask.png"), payload["projected_update_mask"])
-            ImageIO.save_image(step_dir / (prefix + "_projected_blend_mask.png"), payload["projected_blend_mask"])
-            ImageIO.save_image(step_dir / (prefix + "_updated_panorama.png"), payload["updated_panorama"])
-            ImageIO.save_image(step_dir / (prefix + "_updated_known_mask.png"), payload["updated_known_mask"])
             return
 
         if event == "final":
@@ -1719,19 +1839,19 @@ class DebugWriter:
 
         if event == "step":
             record = payload["record"]
-            prefix = (
-                    record["phase"]
-                    + "_yaw_"
-                    + DebugWriter.format_yaw(record["yaw"])
+            DebugWriter.save_stitch(
+                output_dir / "refinement_stitches" / (DebugWriter.step_name(record) + ".png"),
+                payload,
+                [
+                    "source_view",
+                    "refine_mask",
+                    "refined_view",
+                    "blended_view",
+                    "projected_update",
+                    "projected_update_mask",
+                    "updated_panorama",
+                ],
             )
-            step_dir = output_dir / "refinement_steps"
-            ImageIO.save_image(step_dir / (prefix + "_source_view.png"), payload["source_view"])
-            ImageIO.save_image(step_dir / (prefix + "_refine_mask.png"), payload["refine_mask"])
-            ImageIO.save_image(step_dir / (prefix + "_refined_view.png"), payload["refined_view"])
-            ImageIO.save_image(step_dir / (prefix + "_blended_view.png"), payload["blended_view"])
-            ImageIO.save_image(step_dir / (prefix + "_projected_update.png"), payload["projected_update"])
-            ImageIO.save_image(step_dir / (prefix + "_projected_update_mask.png"), payload["projected_update_mask"])
-            ImageIO.save_image(step_dir / (prefix + "_updated_panorama.png"), payload["updated_panorama"])
             return
 
         if event == "final":
