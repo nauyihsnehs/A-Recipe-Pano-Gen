@@ -169,7 +169,7 @@ Medium.
 
 * The paper does not specify exact implementation details for interpolation, mask rasterization, or blending.
 * Use bilinear sampling for images and nearest-neighbor sampling for masks.
-* Use soft alpha blending near mask boundaries to reduce seams.
+* Use hard generated-region masks for compositing.
 
 ---
 
@@ -240,7 +240,7 @@ Recommended reproducible defaults:
 ```yaml
 num_inference_steps: 30-50
 guidance_scale: 5.0-8.0
-mask_blur: 8-32 px
+mask_dilate_kernel: 5
 seed_control: enabled
 output_resolution: 1024x1024
 ```
@@ -454,7 +454,7 @@ The paper applies a partial denoising process to improve image quality:
 ```text
 Use a standard text-to-image diffusion model.
 Denoise using the last 30% of the time steps.
-Blend the refined result into the panorama using a blurred soft mask.
+Blend the refined result into the panorama using the generated-region mask.
 ```
 
 ### Implementation
@@ -465,7 +465,7 @@ refine_panorama(
     generated_mask,
     prompt=global_atmosphere_prompt,
     denoise_strength=0.3,
-    soft_mask_blur=True
+    protect_mask=None
 )
 ```
 
@@ -506,7 +506,7 @@ Medium.
 ### Missing or Ambiguous Details
 
 * The paper does not specify the exact refinement model.
-* It does not define the exact soft-mask blur kernel.
+* It does not define the exact mask compositing kernel.
 * It does not state whether refinement is applied to the full panorama at once or in rendered perspective crops.
 
 Recommended implementation:
@@ -515,8 +515,6 @@ Recommended implementation:
 default_refinement:
   mode: perspective_crop_refinement
   denoise_strength: 0.3
-  mask_blur: 32 px
-  preserve_input_region: true
 ```
 
 ---
@@ -548,7 +546,7 @@ The following details are insufficiently specified in the paper and should be tr
 6. Exact yaw/pitch schedule for all rendered views.
 7. Exact overlap blending strategy.
 8. Exact procedure for removing the backside anchor.
-9. Exact mask dilation, blur, and feathering settings.
+9. Exact mask dilation and compositing settings.
 10. Exact final refinement implementation.
 11. Whether refinement is performed on the panorama directly or via perspective crops.
 
@@ -576,8 +574,8 @@ inpainting:
   model: public_t2i_inpainting_model
   num_steps: 40
   guidance_scale: 7.0
-  mask_blur: 16
-  preserve_input_region: true
+  mask_dilate_kernel: 5
+  protect_conditioning_anchor: true
 
 anchored_synthesis:
   use_backside_anchor: true
@@ -613,7 +611,6 @@ prompting:
 refinement:
   enabled: true
   denoise_strength: 0.3
-  soft_mask_blur: 32
 ```
 
 ---

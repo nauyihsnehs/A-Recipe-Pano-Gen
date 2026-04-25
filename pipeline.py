@@ -24,13 +24,12 @@ def validate_config(config):
                 "seed",
                 "num_steps",
                 "guidance_scale",
-                "mask_blur",
                 "mask_dilate_kernel",
                 "mask_dilate_iterations",
                 "overlap_blend",
             ],
         ),
-        ("refinement", ["enabled", "steps", "guidance_scale", "denoise_strength", "mask_blur"]),
+        ("refinement", ["enabled", "steps", "guidance_scale", "denoise_strength"]),
     ]
 
     for section, keys in required:
@@ -134,7 +133,6 @@ def main():
         seed=synthesis_config["seed"],
         num_steps=synthesis_config["num_steps"],
         guidance_scale=synthesis_config["guidance_scale"],
-        mask_blur=synthesis_config["mask_blur"],
         mask_dilate_kernel=synthesis_config["mask_dilate_kernel"],
         mask_dilate_iterations=synthesis_config["mask_dilate_iterations"],
         overlap_blend=synthesis_config["overlap_blend"],
@@ -150,9 +148,10 @@ def main():
         input_fov_y,
         (panorama_config["width"], panorama_config["height"]),
     )[2]
-    generated_mask = np.where((known_mask > 0) & (input_mask == 0), 255, 0).astype(np.uint8)
+    refine_protect_mask = np.zeros_like(input_mask)
+    generated_mask = np.where(known_mask > 0, 255, 0).astype(np.uint8)
     ImageIO.save_image(debug_dir / "80_generated_mask.png", generated_mask)
-    ImageIO.save_image(debug_dir / "81_input_preserve_mask.png", input_mask)
+    ImageIO.save_image(debug_dir / "81_input_reference_mask.png", input_mask)
     ImageIO.save_image(debug_dir / "82_stage3_panorama.png", panorama)
     ImageIO.save_image(debug_dir / "83_stage3_known_mask.png", known_mask)
     ImageIO.save_image(debug_dir / "84_stage3_missing_mask.png", GeometryTools.compute_missing_mask(known_mask))
@@ -172,7 +171,7 @@ def main():
         final_panorama, refinement_records = PanoramaRefiner.run(
             panorama,
             generated_mask,
-            input_mask,
+            refine_protect_mask,
             global_prompt,
             refine_backend,
             negative_prompt=negative_prompt,
@@ -180,7 +179,6 @@ def main():
             num_steps=refinement_config["steps"],
             guidance_scale=refinement_config["guidance_scale"],
             denoise_strength=refinement_config["denoise_strength"],
-            mask_blur=refinement_config["mask_blur"],
             view_size=view_config["size"],
             middle_fov=view_config["middle_fov"],
             vertical_fov=view_config["vertical_fov"],

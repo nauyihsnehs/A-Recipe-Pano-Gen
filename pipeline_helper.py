@@ -251,18 +251,6 @@ class GeometryTools:
         return cv2.dilate(mask, kernel, iterations=iterations)
 
     @staticmethod
-    def blur_mask(mask, mask_blur):
-        mask = np.clip(mask, 0, 255).astype(np.uint8)
-
-        if mask_blur and float(mask_blur) > 0.0:
-            alpha = mask.astype(np.float32) / 255.0
-            alpha = cv2.GaussianBlur(alpha, (0, 0), float(mask_blur))
-            alpha = np.clip(alpha, 0.0, 1.0)
-            return (alpha * 255.0).astype(np.uint8)
-
-        return mask
-
-    @staticmethod
     def _rotation_matrix(yaw, pitch):
         yaw = math.radians(float(yaw))
         pitch = math.radians(float(pitch))
@@ -460,59 +448,6 @@ class GeometryTools:
 
         return projected
 
-    @staticmethod
-    def project_perspective_soft_mask_to_equirect(mask, fov_x, fov_y, yaw, pitch, pano_size):
-        pano_width, pano_height = GeometryTools._parse_size(pano_size)
-        src_height, src_width = mask.shape[:2]
-        fov_x, fov_y = GeometryTools._check_fov(fov_x, fov_y)
-
-        if pano_width != pano_height * 2:
-            raise ValueError("pano_size must use a 2:1 width:height ratio")
-
-        tan_x = math.tan(math.radians(fov_x) * 0.5)
-        tan_y = math.tan(math.radians(fov_y) * 0.5)
-        rotation = GeometryTools._rotation_matrix(yaw, pitch)
-
-        world_rays = GeometryTools._equirectangular_rays(pano_width, pano_height)
-        camera_rays = world_rays @ rotation
-        camera_z = camera_rays[..., 2]
-
-        x_norm = np.zeros_like(camera_z, dtype=np.float32)
-        y_norm = np.zeros_like(camera_z, dtype=np.float32)
-        visible = camera_z > 1e-6
-
-        np.divide(camera_rays[..., 0], camera_z, out=x_norm, where=visible)
-        np.divide(camera_rays[..., 1], camera_z, out=y_norm, where=visible)
-
-        map_x = ((x_norm / tan_x) + 1.0) * (src_width * 0.5) - 0.5
-        map_y = ((-y_norm / tan_y) + 1.0) * (src_height * 0.5) - 0.5
-        valid = (
-                visible
-                & (np.abs(x_norm) <= tan_x)
-                & (np.abs(y_norm) <= tan_y)
-                & (map_x >= 0.0)
-                & (map_x <= src_width - 1)
-                & (map_y >= 0.0)
-                & (map_y <= src_height - 1)
-        )
-
-        map_x = np.where(valid, map_x, 0.0).astype(np.float32)
-        map_y = np.where(valid, map_y, 0.0).astype(np.float32)
-
-        projected = cv2.remap(
-            np.clip(mask, 0, 255).astype(np.uint8),
-            map_x,
-            map_y,
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-        projection_mask = np.where(valid, 255, 0).astype(np.uint8)
-        projected = np.where(projection_mask > 0, projected, 0).astype(np.uint8)
-
-        return projected
-
-    @staticmethod
     def render_perspective_from_equirect(panorama, yaw, pitch, fov_x, fov_y, out_size):
         out_width, out_height = GeometryTools._parse_size(out_size)
         pano_height, pano_width = panorama.shape[:2]
@@ -598,23 +533,6 @@ class ViewSchedule:
                     "pitch": 0.0,
                     "fov_x": float(middle_fov),
                     "fov_y": float(middle_fov),
-                }
-            )
-
-        for phase, yaw, pitch in [
-            ("top", 90, vertical_pitch),
-            ("top", 270, vertical_pitch),
-            ("bottom", 90, -vertical_pitch),
-            ("bottom", 270, -vertical_pitch),
-        ]:
-            views.append(
-                {
-                    "stage": "side_vertical",
-                    "phase": phase,
-                    "yaw": float(yaw),
-                    "pitch": pitch,
-                    "fov_x": vertical_fov,
-                    "fov_y": vertical_fov,
                 }
             )
 
@@ -798,7 +716,6 @@ class PanoramaUpdater:
             pitch,
             fov_x,
             fov_y,
-            soft_update_mask=None,
             protect_mask=None,
             overlap_blend=False,
     ):
@@ -824,18 +741,6 @@ class PanoramaUpdater:
             pitch,
             pano_size,
         )
-        if soft_update_mask is None:
-            projected_soft_mask = projected_mask
-        else:
-            projected_soft_mask = GeometryTools.project_perspective_soft_mask_to_equirect(
-                soft_update_mask,
-                fov_x,
-                fov_y,
-                yaw,
-                pitch,
-                pano_size,
-            )
-
         if protect_mask is None:
             protect_mask = np.zeros_like(known_mask)
         else:
@@ -862,11 +767,11 @@ class PanoramaUpdater:
         projected_blend_mask = np.zeros_like(known_mask)
         if overlap_blend:
             projected_blend_mask = np.where(
-                (projected_soft_mask > 0)
+                (projected_mask > 0)
                 & (view_footprint > 0)
                 & (known_mask > 0)
                 & (protect_mask == 0),
-                projected_soft_mask,
+                projected_mask,
                 0,
             ).astype(np.uint8)
             blend_region = projected_blend_mask > 0
@@ -990,7 +895,6 @@ class AnchoredSynthesizer:
             num_steps,
             guidance_scale,
             view_size,
-            mask_blur,
             mask_dilate_kernel,
             mask_dilate_iterations,
             protect_mask,
@@ -1019,11 +923,10 @@ class AnchoredSynthesizer:
             mask_dilate_kernel,
             mask_dilate_iterations,
         )
-        soft_inpaint_mask = GeometryTools.blur_mask(inpaint_mask, mask_blur)
-        masked_view = AnchoredSynthesizer.make_masked_view(rendered_view, soft_inpaint_mask)
+        masked_view = AnchoredSynthesizer.make_masked_view(rendered_view, inpaint_mask)
         inpainted_view = AnchoredSynthesizer.run_inpainting(
             masked_view,
-            soft_inpaint_mask,
+            inpaint_mask,
             prompt,
             negative_prompt,
             seed,
@@ -1047,7 +950,6 @@ class AnchoredSynthesizer:
             view["pitch"],
             view["fov_x"],
             view["fov_y"],
-            soft_update_mask=soft_inpaint_mask,
             protect_mask=protect_mask,
             overlap_blend=overlap_blend,
         )
@@ -1057,7 +959,6 @@ class AnchoredSynthesizer:
             "view_known_mask": view_known_mask,
             "raw_inpaint_mask": raw_inpaint_mask,
             "inpaint_mask": inpaint_mask,
-            "soft_inpaint_mask": soft_inpaint_mask,
             "masked_view": masked_view,
             "inpainted_view": inpainted_view,
             "projected_update": projected_update,
@@ -1083,7 +984,6 @@ class AnchoredSynthesizer:
             seed,
             num_steps,
             guidance_scale,
-            mask_blur,
             mask_dilate_kernel,
             mask_dilate_iterations,
             overlap_blend,
@@ -1097,6 +997,10 @@ class AnchoredSynthesizer:
             input_fov_x,
             input_fov_y,
             pano_size,
+        )
+        stitched_panorama, stitched_known_mask = GeometryTools.create_equirectangular_canvas(
+            pano_size[0],
+            pano_size[1],
         )
         records = []
         anchor_removed = False
@@ -1136,18 +1040,8 @@ class AnchoredSynthesizer:
                         },
                     )
 
-            if view["stage"] == "side_vertical" and not horizontal_saved:
-                horizontal_saved = True
-                if debug_writer:
-                    debug_writer(
-                        "after_horizontal",
-                        {
-                            "panorama": panorama,
-                            "known_mask": known_mask,
-                        },
-                    )
-
             known_before = int(np.count_nonzero(known_mask))
+            stitch_before = int(np.count_nonzero(stitched_known_mask))
             prompt = AnchoredSynthesizer.prompt_for_view(view, global_prompt, top_prompt, bottom_prompt)
             protect_mask = input_mask
             if not anchor_removed:
@@ -1164,13 +1058,35 @@ class AnchoredSynthesizer:
                 num_steps,
                 guidance_scale,
                 view_size,
-                mask_blur,
                 mask_dilate_kernel,
                 mask_dilate_iterations,
                 protect_mask,
                 overlap_blend,
             )
+            stitch_mask = np.full(
+                debug_images["inpaint_mask"].shape,
+                255,
+                dtype=np.uint8,
+            )
+            (
+                stitched_panorama,
+                stitched_known_mask,
+                stitch_update,
+                stitch_update_mask,
+                stitch_blend_mask,
+            ) = PanoramaUpdater.update_with_view(
+                stitched_panorama,
+                stitched_known_mask,
+                debug_images["inpainted_view"],
+                stitch_mask,
+                view["yaw"],
+                view["pitch"],
+                view["fov_x"],
+                view["fov_y"],
+                overlap_blend=overlap_blend,
+            )
             known_after = int(np.count_nonzero(known_mask))
+            stitch_after = int(np.count_nonzero(stitched_known_mask))
             record = {
                 "index": index,
                 "stage": view["stage"],
@@ -1182,40 +1098,61 @@ class AnchoredSynthesizer:
                 "known_before": known_before,
                 "known_after": known_after,
                 "known_added": known_after - known_before,
+                "stitch_before": stitch_before,
+                "stitch_after": stitch_after,
+                "stitch_added": stitch_after - stitch_before,
                 "prompt": prompt,
             }
             records.append(record)
 
             if debug_writer:
+                debug_images["stitch_update"] = stitch_update
+                debug_images["stitch_update_mask"] = stitch_update_mask
+                debug_images["stitch_blend_mask"] = stitch_blend_mask
+                debug_images["stitched_panorama"] = stitched_panorama
+                debug_images["stitched_known_mask"] = stitched_known_mask
                 payload = debug_images.copy()
                 payload["record"] = record
                 debug_writer("step", payload)
+
+            next_view = None
+            if index + 1 < len(schedule):
+                next_view = schedule[index + 1]
+
+            if (
+                    view["stage"] == "horizontal"
+                    and not horizontal_saved
+                    and (next_view is None or next_view["stage"] != "horizontal")
+            ):
+                horizontal_saved = True
+                if debug_writer:
+                    debug_writer(
+                        "after_horizontal",
+                        {
+                            "panorama": panorama,
+                            "known_mask": known_mask,
+                            "stitched_panorama": stitched_panorama,
+                            "stitched_known_mask": stitched_known_mask,
+                        },
+                    )
 
         if debug_writer:
             debug_writer(
                 "final",
                 {
-                    "panorama": panorama,
-                    "known_mask": known_mask,
+                    "panorama": stitched_panorama,
+                    "known_mask": stitched_known_mask,
+                    "context_panorama": panorama,
+                    "context_known_mask": known_mask,
                 },
             )
 
-        return panorama, known_mask, records
+        return stitched_panorama, stitched_known_mask, records
 
 
 class PanoramaRefiner:
     @staticmethod
-    def soft_alpha(mask, mask_blur):
-        alpha = np.where(mask > 0, 1.0, 0.0).astype(np.float32)
-
-        if mask_blur and mask_blur > 0:
-            alpha = cv2.GaussianBlur(alpha, (0, 0), float(mask_blur))
-            alpha = np.clip(alpha, 0.0, 1.0)
-
-        return alpha[..., None]
-
-    @staticmethod
-    def project_refined_view(panorama, refined_view, refine_mask, view, input_mask):
+    def project_refined_view(panorama, refined_view, refine_mask, view, protect_mask):
         pano_size = (panorama.shape[1], panorama.shape[0])
         projected_view, footprint = GeometryTools.project_perspective_to_equirect(
             refined_view,
@@ -1234,7 +1171,7 @@ class PanoramaRefiner:
             pano_size,
         )
         projected_update_mask = np.where(
-            (projected_mask > 0) & (footprint > 0) & (input_mask == 0),
+            (projected_mask > 0) & (footprint > 0) & (protect_mask == 0),
             255,
             0,
         ).astype(np.uint8)
@@ -1251,7 +1188,7 @@ class PanoramaRefiner:
     def run(
             panorama,
             generated_mask,
-            input_mask,
+            protect_mask,
             prompt,
             backend,
             negative_prompt,
@@ -1259,7 +1196,6 @@ class PanoramaRefiner:
             num_steps,
             guidance_scale,
             denoise_strength,
-            mask_blur,
             view_size,
             middle_fov,
             vertical_fov,
@@ -1283,8 +1219,8 @@ class PanoramaRefiner:
                 view["fov_y"],
                 out_size,
             )
-            view_input_mask = GeometryTools.render_perspective_mask_from_equirect(
-                input_mask,
+            view_protect_mask = GeometryTools.render_perspective_mask_from_equirect(
+                protect_mask,
                 view["yaw"],
                 view["pitch"],
                 view["fov_x"],
@@ -1292,7 +1228,7 @@ class PanoramaRefiner:
                 out_size,
             )
             refine_mask = np.where(
-                (view_generated_mask > 0) & (view_input_mask == 0),
+                (view_generated_mask > 0) & (view_protect_mask == 0),
                 255,
                 0,
             ).astype(np.uint8)
@@ -1329,7 +1265,8 @@ class PanoramaRefiner:
                 guidance_scale=guidance_scale,
                 denoise_strength=denoise_strength,
             )
-            alpha = PanoramaRefiner.soft_alpha(refine_mask, mask_blur)
+            alpha = np.where(refine_mask > 0, 1.0, 0.0).astype(np.float32)
+            alpha = alpha[..., None]
             blended_view = (
                     refined_view.astype(np.float32) * alpha
                     + source_view.astype(np.float32) * (1.0 - alpha)
@@ -1339,7 +1276,7 @@ class PanoramaRefiner:
                 blended_view,
                 refine_mask,
                 view,
-                input_mask,
+                protect_mask,
             )
             record["skipped"] = False
             record["projected_pixels"] = int(np.count_nonzero(projected_update_mask))
@@ -1825,6 +1762,9 @@ class DebugWriter:
             ImageIO.save_image(output_dir / "50_after_horizontal_panorama.png", payload["panorama"])
             ImageIO.save_image(output_dir / "51_after_horizontal_known_mask.png", payload["known_mask"])
             ImageIO.save_image(output_dir / "52_after_horizontal_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
+            if "stitched_panorama" in payload:
+                ImageIO.save_image(output_dir / "53_after_horizontal_stitched_panorama.png", payload["stitched_panorama"])
+                ImageIO.save_image(output_dir / "54_after_horizontal_stitched_known_mask.png", payload["stitched_known_mask"])
             return
 
         if event == "step":
@@ -1837,7 +1777,6 @@ class DebugWriter:
                     "view_known_mask",
                     "raw_inpaint_mask",
                     "inpaint_mask",
-                    "soft_inpaint_mask",
                     "masked_view",
                     "inpainted_view",
                     "projected_update",
@@ -1845,6 +1784,11 @@ class DebugWriter:
                     "projected_blend_mask",
                     "updated_panorama",
                     "updated_known_mask",
+                    "stitch_update",
+                    "stitch_update_mask",
+                    "stitch_blend_mask",
+                    "stitched_panorama",
+                    "stitched_known_mask",
                 ],
             )
             return
@@ -1853,6 +1797,9 @@ class DebugWriter:
             ImageIO.save_image(output_dir / "90_final_panorama.png", payload["panorama"])
             ImageIO.save_image(output_dir / "91_final_known_mask.png", payload["known_mask"])
             ImageIO.save_image(output_dir / "92_final_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
+            if "context_panorama" in payload:
+                ImageIO.save_image(output_dir / "93_context_panorama.png", payload["context_panorama"])
+                ImageIO.save_image(output_dir / "94_context_known_mask.png", payload["context_known_mask"])
 
     @staticmethod
     def save_refinement_payload(output_dir, event, payload):

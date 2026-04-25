@@ -27,13 +27,13 @@
 | 单张输入图嵌入 2:1 equirectangular panorama。 | 管线加载单张 RGB 图像，并创建 2:1 全景画布。 | `ImageIO.load_image`、`GeometryTools.create_equirectangular_canvas` |
 | 具备 perspective 到 equirectangular，以及 equirectangular 到 perspective 的几何转换。 | 实现了输入图投影到全景图，以及从全景图渲染 perspective crop。 | `project_perspective_to_equirect`、`render_perspective_from_equirect` |
 | 在给定水平 FoV 后，按等焦距假设推导垂直 FoV。 | `estimate_fov` 用 `fov_x`、图像宽高推导 `fov_y`。 | `GeometryTools.estimate_fov` |
-| anchored synthesis 的主顺序。 | 输入图投影到正面，复制到 yaw 180 作为临时背面 anchor，先生成 front/back top/bottom，删除 anchor，再生成 horizontal views，最后生成 side top/bottom。 | `AnchoredSynthesizer.initialize`、`remove_backside_anchor`、`run` |
-| 默认视角数量和 FoV 与论文 Section 3.1 主 recipe 一致。 | schedule 使用 4 个斜向 top view、4 个斜向 bottom view、8 个 horizontal view；顺序为 front/back vertical、horizontal、side vertical；默认 top/bottom FoV 为 120 度，pitch 为 `+/- 45`，middle band 为 85 度。 | `ViewSchedule.anchored`、`pipeline.toml` |
+| anchored synthesis 的主顺序。 | 输入图投影到正面，复制到 yaw 180 作为临时背面 anchor，先生成 front/back top/bottom，删除 anchor，再生成 horizontal views；最终全景从每步 inpainting 完成视图单独 stitch 得到。 | `AnchoredSynthesizer.initialize`、`remove_backside_anchor`、`run` |
+| 默认视角数量和 FoV。 | schedule 使用 4 个 front/back vertical view 和 8 个 horizontal view；默认 top/bottom FoV 为 120 度，pitch 为 `+/- 45`，middle band 为 85 度。 | `ViewSchedule.anchored`、`pipeline.toml` |
 | direction-specific prompt 拆分。 | VLM schema 包含 scene type、global atmosphere、sky/ceiling、ground/floor、negative prompt；top/bottom view 会组合区域 prompt 和 global prompt。 | `PromptTools`、`prompt_for_view` |
 | prompt comparison modes。 | 默认使用论文效果最好的 directional prompts，同时支持 `coarse` 和 `caption` 对比模式。 | `[prompting] mode`、`PromptTools.effective_prompts_for_mode` |
-| main synthesis mask edge cleanup。 | raw binary mask 先膨胀，再生成 soft mask；binary mask 保留用于几何与 known-mask 判断，soft mask 传给 Diffusers 并用于 soft masked view。 | `GeometryTools.dilate_mask`、`GeometryTools.blur_mask`、`soft_inpaint_mask` |
+| main synthesis mask edge cleanup。 | raw binary mask 先膨胀；膨胀后的 hard mask 直接传给 Diffusers，并用于 masked view 与 panorama update。 | `GeometryTools.dilate_mask`、`inpaint_mask` |
 | backside anchor 不作为最终内容保留。 | 进入 horizontal 阶段前清除 anchor-only 像素，并保留原始 input mask。 | `remove_backside_anchor` |
-| 原始输入区域在生成与 refinement 中被保护。 | panorama 更新和 overlap blending 都排除受保护输入区域，refinement 投影时也排除 `input_mask`。 | `PanoramaUpdater.update_with_view`、`PanoramaRefiner.project_refined_view` |
+| 原始输入区域只作为生成上下文使用。 | inpainting context 更新时保护 input/anchor；最终 panorama stitch 从完成后的 inpainted views 单独生成，refinement 默认不再用 `input_mask` 排除区域。 | `PanoramaUpdater.update_with_view`、`PanoramaRefiner.project_refined_view` |
 | 保存中间调试产物。 | prompts、masks、rendered views、inpainted views、projected updates、records、final panorama 等写入 `outputs/<timestamp>/debug`。 | `DebugWriter`、`pipeline.py` |
 
 ## 部分实现但未完全对齐
@@ -48,9 +48,9 @@
 | panorama resolution | 论文高分辨率全景评估使用 2:1 panorama，表格中以 2048 x 4096 像素记法呈现；按本仓库 W x H 约等于 4096 x 2048。 | 默认 2048 x 1024。 | 默认每个维度为论文尺度的一半。 |
 | prompt model | 使用 Llama 3.2 Vision 生成方向性 prompt，并用 Florence-2 作为 caption baseline。 | 使用任意 OpenAI-compatible VLM endpoint，默认本地 `qwen3.6`；`caption` mode 也使用该 VLM。 | prompt behavior 对齐；Florence-2 不实现，因为它不是论文最终方法。 |
 | prompt ablation | 比较 caption prompt、coarse prompt、directional prompts。 | `prompting.mode` 支持 `caption`、`coarse`、`directional`。 | 支持单模式对比，但未实现一个命令同时跑三路输出。 |
-| inpainting mask 边缘平滑 | 附录说明 projection/inpainting 时加入轻微 blur，以避免 sharp mask edges。 | main synthesis 从 raw binary mask 生成 dilated `inpaint_mask`，再生成 `soft_inpaint_mask` 并传给 Diffusers。 | dilation 和 blur 参数可配置，不是论文精确参数。 |
+| inpainting mask 边缘平滑 | 附录说明 projection/inpainting 时加入轻微 blur，以避免 sharp mask edges。 | 当前实现完全移除了 mask edge blur，只保留 dilated `inpaint_mask`。 | 与论文附录不同，边缘处理更硬。 |
 | overlap blending | 论文没有完整说明 overlapping generated views 的融合细节。 | 对 already-generated 且非 input/anchor 区域支持可选保守 image-space overlap blending。 | 融合策略是工程补全，论文未充分指定。 |
-| refinement | 论文使用 standard T2I diffusion，对最后 30% timesteps 做 partial denoising，并用 blurred inpainting mask blend。 | 使用 Diffusers img2img，`denoise_strength = 0.3`，按 schedule 的 perspective view 分块 refinement，再用 blurred mask blend。 | 对齐 30% denoising 思路，但 full panorama 还是 per-view refinement 的精确协议无法确认。 |
+| refinement | 论文使用 standard T2I diffusion，对最后 30% timesteps 做 partial denoising。 | 使用 Diffusers img2img，`denoise_strength = 0.3`，按 schedule 的 perspective view 分块 refinement，并用 hard mask 合成。 | 对齐 30% denoising 思路，但 full panorama 还是 per-view refinement 的精确协议无法确认。 |
 | seed policy | 论文没有充分公开每个 view 的 seed 细节。 | synthesis 从 `seed` 创建一个共享 generator；refinement 从 `seed + 1000` 创建一个共享 generator；每次调用自然推进随机流。 | 可复现并避免每个 view 重复随机起点，但仍不是论文明确公开的低层策略。 |
 
 ## 未实现部分
@@ -128,7 +128,7 @@
 - 当前配置的 VLM endpoint 和 `qwen3.6` 是否支持 OpenAI-compatible `image_url` 输入。
 - 当前 VLM provider 是否接受 `response_format={"type": "json_object"}`。
 - panorama 质量、style consistency、artwork 等困难输入下的边界 artifact，未通过生成结果确认。
-- soft inpainting mask 在真实 backend 中是否足以减少边缘 artifact。
+- hard inpainting mask 在真实 backend 中的边缘 artifact 风险。
 - overlap blending 是否足以减少 seams，需要生成结果视觉确认。
 - per-view refinement 是否视觉上等价于论文描述的 partial denoising。
 - 论文没有充分公开 sampler、guidance scale、seed handling、blend kernel、mask post-processing 等低层参数，因此无法证明完全低层对齐。

@@ -23,7 +23,7 @@ Implemented:
   - front/back top and bottom generation,
   - anchor removal,
   - 8-view horizontal sweep,
-  - side top and bottom generation.
+  - final panorama stitching from completed inpainted views.
 - VLM-generated directional prompts:
   - global atmosphere,
   - sky or ceiling,
@@ -33,7 +33,7 @@ Implemented:
   - `directional` default,
   - `coarse`,
   - `caption`.
-- Soft inpainting mask edge blur for main synthesis.
+- Hard inpainting masks with configurable dilation for main synthesis.
 - Conservative overlap blending for generated regions.
 - Shared stage-level Diffusers generator seeded once per synthesis/refinement stage.
 - Public Diffusers inpainting backend.
@@ -130,16 +130,16 @@ Top-level sections:
 - `models`: Diffusers model ids for inpainting and refinement.
 - `vlm`: OpenAI-compatible VLM endpoint and model settings.
 - `prompting`: prompt mode, one of `directional`, `coarse`, or `caption`.
-- `synthesis`: seed, inpainting step count, guidance scale, mask dilation, mask blur, and overlap blending.
+- `synthesis`: seed, inpainting step count, guidance scale, mask dilation, and overlap blending.
 - `refinement`: optional img2img refinement settings.
 
 Current default local settings:
 
 ```text
-input: inputs/symmetrical_garden_02_8k.jpg
+input: inputs/starry_night.jpg
 panorama: 2048x1024
 view size: 512
-input fov_x: 90.0
+input fov_x: 70.0
 middle fov: 85.0
 vertical fov: 120.0
 top/bottom pitch: +/- 45.0
@@ -148,7 +148,6 @@ refinement model: stabilityai/stable-diffusion-2-1-base
 VLM endpoint: http://127.0.0.1:11435/v1
 VLM model: qwen3.6
 prompt mode: directional
-synthesis mask blur: 8.0
 synthesis mask dilation: 5 px kernel, 1 iteration
 overlap blending: true
 ```
@@ -188,17 +187,18 @@ Anchored synthesis order:
 
 ```text
 0-3:  top 0, top 180, bottom 0, bottom 180
-4-11: horizontal 0, 45, 90, 135, 180, 225, 270, 315
-12-15: top 90, top 270, bottom 90, bottom 270
+4-11: horizontal 22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5
 ```
 
 Anchored stitch panels are written in this order:
 
 ```text
 rendered_view, view_known_mask, raw_inpaint_mask,
-inpaint_mask, soft_inpaint_mask, masked_view,
+inpaint_mask, masked_view,
 inpainted_view, projected_update, projected_update_mask,
-projected_blend_mask, updated_panorama, updated_known_mask
+projected_blend_mask, updated_panorama, updated_known_mask,
+stitch_update, stitch_update_mask, stitch_blend_mask,
+stitched_panorama, stitched_known_mask
 ```
 
 When refinement is enabled, per-view refinement artifacts are written under:

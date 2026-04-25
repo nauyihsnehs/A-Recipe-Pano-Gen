@@ -82,8 +82,8 @@ Finalize the method implementation.
 ### Tasks
 
 - Add optional partial-denoising refinement using the last 30% of diffusion steps.
-- Blend refined regions with a soft mask.
-- Preserve the original input region.
+- Blend refined regions with the generated-region mask.
+- Use the original input only as conditioning context.
 - Save all intermediate debug outputs.
 - Provide a CLI or config-driven script.
 
