@@ -1,16 +1,16 @@
 [paths]
 #input = "inputs/pano_aiypnfgomckrgf.jpg"
-input = "inputs/starry_night.jpg"
-#input = "inputs/symmetrical_garden_02_8k.jpg"
+#input = "inputs/starry_night.jpg"
+input = "inputs/symmetrical_garden_02_8k.jpg"
 output_root = "outputs"
 
 [panorama]
-width = 2048
-height = 1024
-input_fov_x = 70.0
+width = 4096
+height = 2048
+input_fov_x = 90.0
 
 [view]
-size = 512
+size = 1024
 middle_fov = 85.0
 vertical_fov = 120.0
 
