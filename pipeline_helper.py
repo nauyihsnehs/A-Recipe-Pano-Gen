@@ -569,37 +569,52 @@ class ViewSchedule:
     @staticmethod
     def anchored(middle_fov, vertical_fov):
         views = []
+        vertical_fov = float(vertical_fov)
+        vertical_pitch = vertical_fov * 0.5
 
-        for yaw in [0, 90, 180, 270]:
+        for phase, yaw, pitch in [
+            ("top", 0, vertical_pitch),
+            ("top", 180, vertical_pitch),
+            ("bottom", 0, -vertical_pitch),
+            ("bottom", 180, -vertical_pitch),
+        ]:
             views.append(
                 {
-                    "phase": "top",
+                    "stage": "front_back_vertical",
+                    "phase": phase,
                     "yaw": float(yaw),
-                    "pitch": 90.0,
-                    "fov_x": float(vertical_fov),
-                    "fov_y": float(vertical_fov),
+                    "pitch": pitch,
+                    "fov_x": vertical_fov,
+                    "fov_y": vertical_fov,
                 }
             )
 
-        for yaw in [0, 90, 180, 270]:
+        for yaw in [22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5]:
             views.append(
                 {
-                    "phase": "bottom",
-                    "yaw": float(yaw),
-                    "pitch": -90.0,
-                    "fov_x": float(vertical_fov),
-                    "fov_y": float(vertical_fov),
-                }
-            )
-
-        for yaw in [0, 45, 90, 135, 180, 225, 270, 315]:
-            views.append(
-                {
+                    "stage": "horizontal",
                     "phase": "horizontal",
                     "yaw": float(yaw),
                     "pitch": 0.0,
                     "fov_x": float(middle_fov),
                     "fov_y": float(middle_fov),
+                }
+            )
+
+        for phase, yaw, pitch in [
+            ("top", 90, vertical_pitch),
+            ("top", 270, vertical_pitch),
+            ("bottom", 90, -vertical_pitch),
+            ("bottom", 270, -vertical_pitch),
+        ]:
+            views.append(
+                {
+                    "stage": "side_vertical",
+                    "phase": phase,
+                    "yaw": float(yaw),
+                    "pitch": pitch,
+                    "fov_x": vertical_fov,
+                    "fov_y": vertical_fov,
                 }
             )
 
@@ -1085,6 +1100,7 @@ class AnchoredSynthesizer:
         )
         records = []
         anchor_removed = False
+        horizontal_saved = False
         schedule = ViewSchedule.anchored(middle_fov=middle_fov, vertical_fov=vertical_fov)
         generator = None
         if hasattr(backend, "make_generator"):
@@ -1102,16 +1118,7 @@ class AnchoredSynthesizer:
             )
 
         for index, view in enumerate(schedule):
-            if view["phase"] == "horizontal" and not anchor_removed:
-                if debug_writer:
-                    debug_writer(
-                        "after_vertical",
-                        {
-                            "panorama": panorama,
-                            "known_mask": known_mask,
-                        },
-                    )
-
+            if view["stage"] == "horizontal" and not anchor_removed:
                 panorama, known_mask = AnchoredSynthesizer.remove_backside_anchor(
                     panorama,
                     known_mask,
@@ -1122,7 +1129,18 @@ class AnchoredSynthesizer:
 
                 if debug_writer:
                     debug_writer(
-                        "anchor_removed",
+                        "after_front_back_vertical",
+                        {
+                            "panorama": panorama,
+                            "known_mask": known_mask,
+                        },
+                    )
+
+            if view["stage"] == "side_vertical" and not horizontal_saved:
+                horizontal_saved = True
+                if debug_writer:
+                    debug_writer(
+                        "after_horizontal",
                         {
                             "panorama": panorama,
                             "known_mask": known_mask,
@@ -1155,6 +1173,7 @@ class AnchoredSynthesizer:
             known_after = int(np.count_nonzero(known_mask))
             record = {
                 "index": index,
+                "stage": view["stage"],
                 "phase": view["phase"],
                 "yaw": view["yaw"],
                 "pitch": view["pitch"],
@@ -1280,6 +1299,7 @@ class PanoramaRefiner:
             pixel_count = int(np.count_nonzero(refine_mask))
             record = {
                 "index": index,
+                "stage": view["stage"],
                 "phase": view["phase"],
                 "yaw": view["yaw"],
                 "pitch": view["pitch"],
@@ -1795,15 +1815,16 @@ class DebugWriter:
             ImageIO.save_image(output_dir / "04_initial_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
             return
 
-        if event == "after_vertical":
-            ImageIO.save_image(output_dir / "30_after_top_bottom_panorama.png", payload["panorama"])
-            ImageIO.save_image(output_dir / "31_after_top_bottom_known_mask.png", payload["known_mask"])
+        if event == "after_front_back_vertical":
+            ImageIO.save_image(output_dir / "30_after_front_back_vertical_panorama.png", payload["panorama"])
+            ImageIO.save_image(output_dir / "31_after_front_back_vertical_known_mask.png", payload["known_mask"])
+            ImageIO.save_image(output_dir / "32_after_front_back_vertical_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
             return
 
-        if event == "anchor_removed":
-            ImageIO.save_image(output_dir / "40_anchor_removed_panorama.png", payload["panorama"])
-            ImageIO.save_image(output_dir / "41_anchor_removed_known_mask.png", payload["known_mask"])
-            ImageIO.save_image(output_dir / "42_anchor_removed_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
+        if event == "after_horizontal":
+            ImageIO.save_image(output_dir / "50_after_horizontal_panorama.png", payload["panorama"])
+            ImageIO.save_image(output_dir / "51_after_horizontal_known_mask.png", payload["known_mask"])
+            ImageIO.save_image(output_dir / "52_after_horizontal_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
             return
 
         if event == "step":

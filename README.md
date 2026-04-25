@@ -20,9 +20,10 @@ Implemented:
 - Anchored panorama synthesis:
   - front input projection,
   - temporary backside anchor,
-  - top and bottom generation first,
+  - front/back top and bottom generation,
   - anchor removal,
-  - 8-view horizontal sweep.
+  - 8-view horizontal sweep,
+  - side top and bottom generation.
 - VLM-generated directional prompts:
   - global atmosphere,
   - sky or ceiling,
@@ -141,6 +142,7 @@ view size: 512
 input fov_x: 90.0
 middle fov: 85.0
 vertical fov: 120.0
+top/bottom pitch: +/- vertical_fov / 2
 inpainting model: stabilityai/stable-diffusion-2-inpainting
 refinement model: stabilityai/stable-diffusion-2-1-base
 VLM endpoint: http://127.0.0.1:11435/v1
@@ -168,6 +170,7 @@ debug/anchored/
 Main debug artifacts include:
 
 - initial front/back anchor panorama,
+- stage snapshots after front/back vertical views and horizontal views,
 - known masks and missing masks,
 - per-view stitch images under `debug/anchored/stitches/`,
 - final stage-3 panorama,
@@ -178,7 +181,15 @@ Main debug artifacts include:
 Each anchored stitch is named by execution order, phase, yaw, and pitch, for example:
 
 ```text
-debug/anchored/stitches/00_top_yaw_000_pitch_p090.png
+debug/anchored/stitches/00_top_yaw_000_pitch_p060.png
+```
+
+Anchored synthesis order:
+
+```text
+0-3:  top 0, top 180, bottom 0, bottom 180
+4-11: horizontal 0, 45, 90, 135, 180, 225, 270, 315
+12-15: top 90, top 270, bottom 90, bottom 270
 ```
 
 Anchored stitch panels are written in this order:
