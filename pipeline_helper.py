@@ -544,9 +544,9 @@ class DiffusersInpaintingBackend(DiffusersBackendBase):
 
 class DiffusersImg2ImgRefinementBackend(DiffusersBackendBase):
     def __init__(self, model_id):
-        from diffusers import DiffusionPipeline
+        from diffusers import AutoPipelineForImage2Image
         super().__init__(model_id)
-        self.pipeline_class = DiffusionPipeline
+        self.pipeline_class = AutoPipelineForImage2Image
 
     def __call__(
             self,
@@ -572,8 +572,10 @@ class DiffusersImg2ImgRefinementBackend(DiffusersBackendBase):
 
         result = self.pipeline(
             prompt=prompt,
-            negative_prompt=negative_prompt or None,
+            negative_prompt=negative_prompt,
             image=image_pil,
+            height=image.shape[0],
+            width=image.shape[1],
             strength=float(denoise_strength),
             num_inference_steps=int(num_steps),
             guidance_scale=float(guidance_scale),
