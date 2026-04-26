@@ -333,27 +333,11 @@ class GeometryTools:
 
     @staticmethod
     def project_perspective_to_equirect(image, fov_x, fov_y, yaw, pitch, pano_size):
-        return GeometryTools._project_perspective(
-            image,
-            fov_x,
-            fov_y,
-            yaw,
-            pitch,
-            pano_size,
-            cv2.INTER_LINEAR,
-        )
+        return GeometryTools._project_perspective(image, fov_x, fov_y, yaw, pitch, pano_size, cv2.INTER_LINEAR)
 
     @staticmethod
     def project_perspective_mask_to_equirect(mask, fov_x, fov_y, yaw, pitch, pano_size):
-        projected, footprint = GeometryTools._project_perspective(
-            mask,
-            fov_x,
-            fov_y,
-            yaw,
-            pitch,
-            pano_size,
-            cv2.INTER_NEAREST,
-        )
+        projected, footprint = GeometryTools._project_perspective(mask, fov_x, fov_y, yaw, pitch, pano_size, cv2.INTER_NEAREST)
 
         return GeometryTools.binary_mask(np.where(footprint > 0, projected, 0))
 
@@ -381,66 +365,44 @@ class GeometryTools:
 
     @staticmethod
     def render_perspective_from_equirect(panorama, yaw, pitch, fov_x, fov_y, view_render_size):
-        return GeometryTools._render_perspective_impl(
-            panorama,
-            yaw,
-            pitch,
-            fov_x,
-            fov_y,
-            view_render_size,
-            cv2.INTER_LINEAR,
-        )
+        return GeometryTools._render_perspective_impl(panorama, yaw, pitch, fov_x, fov_y, view_render_size, cv2.INTER_LINEAR)
 
     @staticmethod
     def render_perspective_mask_from_equirect(mask, yaw, pitch, fov_x, fov_y, view_render_size):
-        return GeometryTools._render_perspective_impl(
-            mask,
-            yaw,
-            pitch,
-            fov_x,
-            fov_y,
-            view_render_size,
-            cv2.INTER_NEAREST,
-        )
+        return GeometryTools._render_perspective_impl(mask, yaw, pitch, fov_x, fov_y, view_render_size, cv2.INTER_NEAREST)
 
 
 class ViewSchedule:
     @staticmethod
     def anchored(middle_fov, vertical_fov):
-        views = []
         vertical_fov = float(vertical_fov)
-        vertical_pitch = 45.0
+        middle_fov = float(middle_fov)
 
-        for phase, yaw, pitch in [
-            ("top", 0, vertical_pitch),
-            ("top", 180, vertical_pitch),
-            ("bottom", 0, -vertical_pitch),
-            ("bottom", 180, -vertical_pitch),
-        ]:
-            views.append(
-                SimpleNamespace(
-                    stage="front_back_vertical",
-                    phase=phase,
-                    yaw=float(yaw),
-                    pitch=pitch,
-                    fov_x=vertical_fov,
-                    fov_y=vertical_fov,
-                )
+        def view(stage, phase, yaw, pitch, fov):
+            return SimpleNamespace(
+                stage=stage,
+                phase=phase,
+                yaw=float(yaw),
+                pitch=float(pitch),
+                fov_x=fov,
+                fov_y=fov,
             )
 
-        for yaw in np.arange(22.5, 360.0, 45.0):
-            views.append(
-                SimpleNamespace(
-                    stage="horizontal",
-                    phase="horizontal",
-                    yaw=float(yaw),
-                    pitch=0.0,
-                    fov_x=float(middle_fov),
-                    fov_y=float(middle_fov),
-                )
-            )
+        vertical_views = [
+            view("front_back_vertical", phase, yaw, pitch, vertical_fov)
+            for phase, yaw, pitch in [
+                ("top", 0, 45.0),
+                ("top", 180, 45.0),
+                ("bottom", 0, -45.0),
+                ("bottom", 180, -45.0),
+            ]
+        ]
+        horizontal_views = [
+            view("horizontal", "horizontal", yaw, 0.0, middle_fov)
+            for yaw in np.arange(22.5, 360.0, 45.0)
+        ]
 
-        return views
+        return vertical_views + horizontal_views
 
 
 class DiffusersLoader:
@@ -492,9 +454,16 @@ class DiffusersBackendBase:
         self.device = device
         return self.pipeline
 
+    def ensure_loaded(self):
+        if self.pipeline is None:
+            self.load()
+
     def make_generator(self, seed):
         import torch
         return torch.Generator(device=self.device).manual_seed(int(seed))
+
+    def resolve_generator(self, generator, seed):
+        return generator if generator is not None else self.make_generator(seed)
 
 
 class DiffusersInpaintingBackend(DiffusersBackendBase):
@@ -514,18 +483,12 @@ class DiffusersInpaintingBackend(DiffusersBackendBase):
             num_steps=40,
             guidance_scale=7.5,
     ):
-        import torch
-
-        if self.pipeline is None:
-            self.load()
+        self.ensure_loaded()
 
         image = ImageIO.to_uint8(image)
         mask = GeometryTools.binary_mask(mask)
         image_pil = Image.fromarray(image).convert("RGB")
         mask_pil = Image.fromarray(mask).convert("L")
-
-        if generator is None:
-            generator = torch.Generator(device=self.device).manual_seed(int(seed))
 
         result = self.pipeline(
             prompt=prompt,
@@ -536,7 +499,7 @@ class DiffusersInpaintingBackend(DiffusersBackendBase):
             width=image.shape[1],
             num_inference_steps=int(num_steps),
             guidance_scale=float(guidance_scale),
-            generator=generator,
+            generator=self.resolve_generator(generator, seed),
         )
 
         return np.asarray(result.images[0].convert("RGB"))
@@ -544,9 +507,9 @@ class DiffusersInpaintingBackend(DiffusersBackendBase):
 
 class DiffusersImg2ImgRefinementBackend(DiffusersBackendBase):
     def __init__(self, model_id):
-        from diffusers import DiffusionPipeline
+        from diffusers import AutoPipelineForImage2Image
         super().__init__(model_id)
-        self.pipeline_class = DiffusionPipeline
+        self.pipeline_class = AutoPipelineForImage2Image
 
     def __call__(
             self,
@@ -559,25 +522,21 @@ class DiffusersImg2ImgRefinementBackend(DiffusersBackendBase):
             guidance_scale=7.5,
             denoise_strength=0.3,
     ):
-        import torch
-
-        if self.pipeline is None:
-            self.load()
+        self.ensure_loaded()
 
         image = ImageIO.to_uint8(image)
         image_pil = Image.fromarray(image).convert("RGB")
 
-        if generator is None:
-            generator = torch.Generator(device=self.device).manual_seed(int(seed))
-
         result = self.pipeline(
             prompt=prompt,
-            negative_prompt=negative_prompt or None,
+            negative_prompt=negative_prompt,
             image=image_pil,
+            height=image.shape[0],
+            width=image.shape[1],
             strength=float(denoise_strength),
             num_inference_steps=int(num_steps),
             guidance_scale=float(guidance_scale),
-            generator=generator,
+            generator=self.resolve_generator(generator, seed),
         )
 
         return np.asarray(result.images[0].convert("RGB"))
@@ -670,40 +629,16 @@ class AnchoredSynthesizer:
     @staticmethod
     def initialize(input_image, input_fov_x, input_fov_y, pano_size):
         panorama, known_mask = GeometryTools.create_equirectangular_canvas(pano_size[0], pano_size[1])
-        front_image, input_mask = GeometryTools.project_perspective_to_equirect(
-            input_image,
-            input_fov_x,
-            input_fov_y,
-            0.0,
-            0.0,
-            pano_size,
-        )
-        panorama, known_mask = GeometryTools.paste_projected_view(
-            panorama,
-            known_mask,
-            front_image,
-            input_mask,
-        )
+        masks = []
 
-        anchor_image, anchor_mask = GeometryTools.project_perspective_to_equirect(
-            input_image,
-            input_fov_x,
-            input_fov_y,
-            180.0,
-            0.0,
-            pano_size,
-        )
-        panorama, known_mask = GeometryTools.paste_projected_view(
-            panorama,
-            known_mask,
-            anchor_image,
-            anchor_mask,
-        )
+        for yaw in [0.0, 180.0]:
+            image, mask = GeometryTools.project_perspective_to_equirect(
+                input_image, input_fov_x, input_fov_y, yaw, 0.0, pano_size,
+            )
+            panorama, known_mask = GeometryTools.paste_projected_view(panorama, known_mask, image, mask)
+            masks.append(GeometryTools.binary_mask(mask))
 
-        input_mask = GeometryTools.binary_mask(input_mask)
-        anchor_mask = GeometryTools.binary_mask(anchor_mask)
-
-        return panorama, known_mask, input_mask, anchor_mask
+        return panorama, known_mask, masks[0], masks[1]
 
     @staticmethod
     def remove_backside_anchor(panorama, known_mask, input_mask, anchor_mask):
@@ -829,60 +764,34 @@ class AnchoredSynthesizer:
             vertical_fov,
             debug_writer=None,
     ):
-        panorama, known_mask, input_mask, anchor_mask = AnchoredSynthesizer.initialize(
-            input_image,
-            input_fov_x,
-            input_fov_y,
-            pano_size,
-        )
-        stitched_panorama, stitched_known_mask = GeometryTools.create_equirectangular_canvas(
-            pano_size[0],
-            pano_size[1],
-        )
+        panorama, known_mask, input_mask, anchor_mask = AnchoredSynthesizer.initialize(input_image, input_fov_x, input_fov_y, pano_size)
+        stitched_panorama, stitched_known_mask = GeometryTools.create_equirectangular_canvas(pano_size[0], pano_size[1])
         records = []
         anchor_removed = False
         horizontal_saved = False
         schedule = ViewSchedule.anchored(middle_fov=middle_fov, vertical_fov=vertical_fov)
-        generator = None
-        if hasattr(backend, "make_generator"):
-            generator = backend.make_generator(seed)
+        generator = backend.make_generator(seed) if hasattr(backend, "make_generator") else None
 
         if debug_writer:
-            debug_writer(
-                "initial",
-                {
-                    "panorama": panorama,
-                    "known_mask": known_mask,
-                    "input_mask": input_mask,
-                    "anchor_mask": anchor_mask,
-                },
-            )
+            debug_writer("initial", {
+                "panorama": panorama,
+                "known_mask": known_mask,
+                "input_mask": input_mask,
+                "anchor_mask": anchor_mask,
+            })
 
         for index, view in enumerate(schedule):
             if view.stage == "horizontal" and not anchor_removed:
-                panorama, known_mask = AnchoredSynthesizer.remove_backside_anchor(
-                    panorama,
-                    known_mask,
-                    input_mask,
-                    anchor_mask,
-                )
+                panorama, known_mask = AnchoredSynthesizer.remove_backside_anchor(panorama, known_mask, input_mask, anchor_mask)
                 anchor_removed = True
 
                 if debug_writer:
-                    debug_writer(
-                        "after_front_back_vertical",
-                        {
-                            "panorama": panorama,
-                            "known_mask": known_mask,
-                        },
-                    )
+                    debug_writer("after_front_back_vertical", {"panorama": panorama, "known_mask": known_mask})
 
             known_before = int(np.count_nonzero(known_mask))
             stitch_before = int(np.count_nonzero(stitched_known_mask))
             prompt = AnchoredSynthesizer.prompt_for_view(view, global_prompt, top_prompt, bottom_prompt)
-            protect_mask = input_mask
-            if not anchor_removed:
-                protect_mask = np.maximum(input_mask, anchor_mask)
+            protect_mask = input_mask if anchor_removed else np.maximum(input_mask, anchor_mask)
             panorama, known_mask, debug_images = AnchoredSynthesizer.run_step(
                 panorama,
                 known_mask,
@@ -900,11 +809,7 @@ class AnchoredSynthesizer:
                 protect_mask,
                 overlap_blend,
             )
-            stitch_mask = np.full(
-                debug_images["inpaint_mask"].shape,
-                255,
-                dtype=np.uint8,
-            )
+            stitch_mask = np.full(debug_images["inpaint_mask"].shape, 255, dtype=np.uint8)
             (
                 stitched_panorama,
                 stitched_known_mask,
@@ -924,22 +829,12 @@ class AnchoredSynthesizer:
             )
             known_after = int(np.count_nonzero(known_mask))
             stitch_after = int(np.count_nonzero(stitched_known_mask))
-            record = {
-                "index": index,
-                "stage": view.stage,
-                "phase": view.phase,
-                "yaw": view.yaw,
-                "pitch": view.pitch,
-                "fov_x": view.fov_x,
-                "fov_y": view.fov_y,
-                "known_before": known_before,
-                "known_after": known_after,
-                "known_added": known_after - known_before,
-                "stitch_before": stitch_before,
-                "stitch_after": stitch_after,
-                "stitch_added": stitch_after - stitch_before,
-                "prompt": prompt,
-            }
+            record = dict(
+                index=index, stage=view.stage, phase=view.phase, yaw=view.yaw, pitch=view.pitch,
+                fov_x=view.fov_x, fov_y=view.fov_y, known_before=known_before, known_after=known_after,
+                known_added=known_after - known_before, stitch_before=stitch_before,
+                stitch_after=stitch_after, stitch_added=stitch_after - stitch_before, prompt=prompt,
+            )
             records.append(record)
 
             debug_images.update(
@@ -954,33 +849,24 @@ class AnchoredSynthesizer:
             if debug_writer:
                 debug_writer("step", payload)
 
-            last_horizontal_view = (
-                    view.stage == "horizontal"
-                    and (index + 1 >= len(schedule) or schedule[index + 1].stage != "horizontal")
-            )
+            last_horizontal_view = view.stage == "horizontal" and (index + 1 >= len(schedule) or schedule[index + 1].stage != "horizontal")
             if last_horizontal_view and not horizontal_saved:
                 horizontal_saved = True
                 if debug_writer:
-                    debug_writer(
-                        "after_horizontal",
-                        {
-                            "panorama": panorama,
-                            "known_mask": known_mask,
-                            "stitched_panorama": stitched_panorama,
-                            "stitched_known_mask": stitched_known_mask,
-                        },
-                    )
+                    debug_writer("after_horizontal", {
+                        "panorama": panorama,
+                        "known_mask": known_mask,
+                        "stitched_panorama": stitched_panorama,
+                        "stitched_known_mask": stitched_known_mask,
+                    })
 
         if debug_writer:
-            debug_writer(
-                "final",
-                {
-                    "panorama": stitched_panorama,
-                    "known_mask": stitched_known_mask,
-                    "context_panorama": panorama,
-                    "context_known_mask": known_mask,
-                },
-            )
+            debug_writer("final", {
+                "panorama": stitched_panorama,
+                "known_mask": stitched_known_mask,
+                "context_panorama": panorama,
+                "context_known_mask": known_mask,
+            })
 
         return stitched_panorama, stitched_known_mask, records
 
@@ -1022,52 +908,29 @@ class PanoramaRefiner:
         records = []
         schedule = ViewSchedule.anchored(middle_fov=middle_fov, vertical_fov=vertical_fov)
         generator_seed = int(seed) + 1000
-        generator = None
-        if hasattr(backend, "make_generator"):
-            generator = backend.make_generator(generator_seed)
+        generator = backend.make_generator(generator_seed) if hasattr(backend, "make_generator") else None
 
         for index, view in enumerate(schedule):
             view_render_size = (view_size, view_size)
             view_generated_mask = GeometryTools.render_perspective_mask_from_equirect(
-                generated_mask,
-                view.yaw,
-                view.pitch,
-                view.fov_x,
-                view.fov_y,
-                view_render_size,
+                generated_mask, view.yaw, view.pitch, view.fov_x, view.fov_y, view_render_size,
             )
             view_protect_mask = GeometryTools.render_perspective_mask_from_equirect(
-                protect_mask,
-                view.yaw,
-                view.pitch,
-                view.fov_x,
-                view.fov_y,
-                view_render_size,
+                protect_mask, view.yaw, view.pitch, view.fov_x, view.fov_y, view_render_size,
             )
             refine_mask = np.where((view_generated_mask > 0) & (view_protect_mask == 0), 255, 0).astype(np.uint8)
             pixel_count = int(np.count_nonzero(refine_mask))
-            record = {
-                "index": index,
-                "stage": view.stage,
-                "phase": view.phase,
-                "yaw": view.yaw,
-                "pitch": view.pitch,
-                "refine_pixels": pixel_count,
-            }
+            record = dict(
+                index=index, stage=view.stage, phase=view.phase, yaw=view.yaw,
+                pitch=view.pitch, refine_pixels=pixel_count,
+            )
 
             if pixel_count == 0:
                 record["skipped"] = True
                 records.append(record)
                 continue
 
-            source_view = GeometryTools.render_perspective_from_equirect(
-                refined,
-                view.yaw,
-                view.pitch,
-                view.fov_x,
-                view.fov_y,
-                view_render_size,
-            )
+            source_view = GeometryTools.render_perspective_from_equirect(refined, view.yaw, view.pitch, view.fov_x, view.fov_y, view_render_size)
             refined_view = backend(
                 source_view,
                 prompt,
@@ -1081,39 +944,25 @@ class PanoramaRefiner:
             alpha = np.where(refine_mask > 0, 1.0, 0.0).astype(np.float32)
             alpha = alpha[..., None]
             blended_view = (refined_view.astype(np.float32) * alpha + source_view.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
-            refined, projected_update, projected_update_mask = PanoramaRefiner.project_refined_view(
-                refined,
-                blended_view,
-                refine_mask,
-                view,
-                protect_mask,
-            )
+            refined, projected_update, projected_update_mask = PanoramaRefiner.project_refined_view(refined, blended_view, refine_mask, view, protect_mask)
             record["skipped"] = False
             record["projected_pixels"] = int(np.count_nonzero(projected_update_mask))
             records.append(record)
 
             if debug_writer:
-                debug_writer(
-                    "step",
-                    {
-                        "record": record,
-                        "source_view": source_view,
-                        "refine_mask": refine_mask,
-                        "refined_view": refined_view,
-                        "blended_view": blended_view,
-                        "projected_update": projected_update,
-                        "projected_update_mask": projected_update_mask,
-                        "updated_panorama": refined,
-                    },
-                )
+                debug_writer("step", {
+                    "record": record,
+                    "source_view": source_view,
+                    "refine_mask": refine_mask,
+                    "refined_view": refined_view,
+                    "blended_view": blended_view,
+                    "projected_update": projected_update,
+                    "projected_update_mask": projected_update_mask,
+                    "updated_panorama": refined,
+                })
 
         if debug_writer:
-            debug_writer(
-                "final",
-                {
-                    "panorama": refined,
-                },
-            )
+            debug_writer("final", {"panorama": refined})
 
         return refined, records
 
@@ -1205,8 +1054,7 @@ class PromptTools:
     def save_prompts(path, prompts):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        prompts = PromptTools.validate_schema(prompts)
-        path.write_text(json.dumps(prompts, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        ImageIO.save_json(path, PromptTools.validate_schema(prompts))
 
     @staticmethod
     def save_prompt_payload(path, payload):
@@ -1217,7 +1065,7 @@ class PromptTools:
         if "effective_prompts" not in payload:
             raise ValueError("prompt payload missing effective_prompts")
         payload["effective_prompts"] = PromptTools.validate_schema(payload["effective_prompts"])
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        ImageIO.save_json(path, payload)
 
     @staticmethod
     def effective_prompts_for_mode(mode, directional_prompts=None, caption_prompt=None):
@@ -1265,14 +1113,11 @@ class PromptTools:
             return content
 
         if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(item.get("text", ""))
-                elif hasattr(item, "text"):
-                    parts.append(item.text)
-
-            return "".join(parts)
+            return "".join(
+                item.get("text", "") if isinstance(item, dict) and item.get("type") == "text"
+                else getattr(item, "text", "")
+                for item in content
+            )
 
         return str(content)
 
@@ -1290,16 +1135,14 @@ class PromptTools:
 
     @staticmethod
     def extra_headers(vlm_config):
-        headers = {}
-        http_referer = vlm_config.get("http_referer", "")
-        title = vlm_config.get("title", "")
-
-        if http_referer:
-            headers["HTTP-Referer"] = http_referer
-        if title:
-            headers["X-OpenRouter-Title"] = title
-
-        return headers
+        return {
+            key: value
+            for key, value in [
+                ("HTTP-Referer", vlm_config.get("http_referer", "")),
+                ("X-OpenRouter-Title", vlm_config.get("title", "")),
+            ]
+            if value
+        }
 
     @staticmethod
     def _create_openai_client(vlm_config):
@@ -1310,15 +1153,19 @@ class PromptTools:
         return OpenAI(**kwargs)
 
     @staticmethod
-    def generate_panorama_prompts(image, vlm_config):
-        client = PromptTools._create_openai_client(vlm_config)
-        messages = [
-            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+    def image_messages(system_prompt, user_prompt, image):
+        return [
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "text", "text": DEFAULT_USER_PROMPT},
+                {"type": "text", "text": user_prompt},
                 {"type": "image_url", "image_url": {"url": PromptTools.image_to_data_url(image)}},
             ]},
         ]
+
+    @staticmethod
+    def generate_panorama_prompts(image, vlm_config):
+        client = PromptTools._create_openai_client(vlm_config)
+        messages = PromptTools.image_messages(DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT, image)
         response = PromptTools.create_completion(
             client,
             vlm_config["model"],
@@ -1334,13 +1181,7 @@ class PromptTools:
     @staticmethod
     def generate_caption_prompt(image, vlm_config):
         client = PromptTools._create_openai_client(vlm_config)
-        messages = [
-            {"role": "system", "content": DEFAULT_CAPTION_SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": DEFAULT_CAPTION_USER_PROMPT},
-                {"type": "image_url", "image_url": {"url": PromptTools.image_to_data_url(image)}},
-            ]},
-        ]
+        messages = PromptTools.image_messages(DEFAULT_CAPTION_SYSTEM_PROMPT, DEFAULT_CAPTION_USER_PROMPT, image)
         response = PromptTools.create_completion(
             client,
             vlm_config["model"],
@@ -1361,29 +1202,19 @@ class PromptTools:
 class DebugWriter:
     @staticmethod
     def format_yaw(yaw):
-        yaw = int(round(yaw)) % 360
-
-        return str(yaw).zfill(3)
+        return str(int(round(yaw)) % 360).zfill(3)
 
     @staticmethod
     def format_pitch(pitch):
         pitch = int(round(pitch))
-        sign = "p"
-        if pitch < 0:
-            sign = "n"
-
-        return sign + str(abs(pitch)).zfill(3)
+        return ("n" if pitch < 0 else "p") + str(abs(pitch)).zfill(3)
 
     @staticmethod
     def step_name(record):
         return (
-                str(int(record["index"])).zfill(2)
-                + "_"
-                + record["phase"]
-                + "_yaw_"
-                + DebugWriter.format_yaw(record["yaw"])
-                + "_pitch_"
-                + DebugWriter.format_pitch(record["pitch"])
+            f'{int(record["index"]):02d}_{record["phase"]}'
+            f'_yaw_{DebugWriter.format_yaw(record["yaw"])}'
+            f'_pitch_{DebugWriter.format_pitch(record["pitch"])}'
         )
 
     @staticmethod
@@ -1399,21 +1230,13 @@ class DebugWriter:
 
     @staticmethod
     def stitch_panel_size(panels):
-        square_sizes = []
-
-        for _, image in panels:
-            height, width = image.shape[:2]
-            if width <= 0 or height <= 0:
-                continue
-            aspect = width / float(height)
-            if aspect >= 0.75 and aspect <= 1.35:
-                square_sizes.append(max(width, height))
-
-        if square_sizes:
-            size = max(square_sizes)
-        else:
-            size = 512
-
+        square_sizes = [
+            max(width, height)
+            for _, image in panels
+            for height, width in [image.shape[:2]]
+            if width > 0 and height > 0 and 0.75 <= width / float(height) <= 1.35
+        ]
+        size = max(square_sizes) if square_sizes else 512
         size = max(320, min(size, 768))
 
         return size, size
@@ -1433,11 +1256,7 @@ class DebugWriter:
 
     @staticmethod
     def save_stitch(path, payload, names):
-        panels = []
-
-        for name in names:
-            if name in payload:
-                panels.append((name, DebugWriter.panel_image(payload[name])))
+        panels = [(name, DebugWriter.panel_image(payload[name])) for name in names if name in payload]
 
         if not panels:
             return
@@ -1466,9 +1285,7 @@ class DebugWriter:
             scale = min(panel_width / float(image_width), panel_height / float(image_height))
             resized_width = max(1, int(round(image_width * scale)))
             resized_height = max(1, int(round(image_height * scale)))
-            interpolation = cv2.INTER_LINEAR
-            if scale < 1.0:
-                interpolation = cv2.INTER_AREA
+            interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
             resized = cv2.resize(image, (resized_width, resized_height), interpolation=interpolation)
             image_left = (panel_width - resized_width) // 2
             image_top = label_height + (panel_height - resized_height) // 2
@@ -1523,10 +1340,14 @@ class DebugWriter:
         "after_horizontal": [
             ("panorama", "50_after_horizontal_panorama"),
             ("known_mask", "51_after_horizontal_known_mask"),
+            ("stitched_panorama", "53_after_horizontal_stitched_panorama"),
+            ("stitched_known_mask", "54_after_horizontal_stitched_known_mask"),
         ],
         "final": [
             ("panorama", "90_final_panorama"),
             ("known_mask", "91_final_known_mask"),
+            ("context_panorama", "93_context_panorama"),
+            ("context_known_mask", "94_context_known_mask"),
         ],
     }
 
@@ -1536,6 +1357,12 @@ class DebugWriter:
         "after_horizontal": "52",
         "final": "92",
     }
+
+    @staticmethod
+    def save_named_images(output_dir, payload, names):
+        for key, name in names:
+            if key in payload:
+                ImageIO.save_image(output_dir / f"{name}.png", payload[key])
 
     @staticmethod
     def save_anchored_synthesis_payload(output_dir, event, payload):
@@ -1548,25 +1375,10 @@ class DebugWriter:
             return
 
         output_dir = Path(output_dir)
-        for key, name in DebugWriter.ANCHORED_SYNTHESIS_EVENTS.get(event, []):
-            if key in payload:
-                ImageIO.save_image(output_dir / f"{name}.png", payload[key])
-
+        DebugWriter.save_named_images(output_dir, payload, DebugWriter.ANCHORED_SYNTHESIS_EVENTS.get(event, []))
         if event in DebugWriter.MISSING_MASK_PREFIXES and "known_mask" in payload:
             prefix = DebugWriter.MISSING_MASK_PREFIXES[event]
-            missing_mask = GeometryTools.compute_missing_mask(payload["known_mask"])
-            ImageIO.save_image(output_dir / f"{prefix}_missing_mask.png", missing_mask)
-
-        if event == "after_horizontal" and "stitched_panorama" in payload:
-            ImageIO.save_image(output_dir / "53_after_horizontal_stitched_panorama.png", payload["stitched_panorama"])
-            ImageIO.save_image(
-                output_dir / "54_after_horizontal_stitched_known_mask.png",
-                payload["stitched_known_mask"],
-            )
-        elif event == "final":
-            if "context_panorama" in payload:
-                ImageIO.save_image(output_dir / "93_context_panorama.png", payload["context_panorama"])
-                ImageIO.save_image(output_dir / "94_context_known_mask.png", payload["context_known_mask"])
+            ImageIO.save_image(output_dir / f"{prefix}_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
 
     @staticmethod
     def save_refinement_payload(output_dir, event, payload):

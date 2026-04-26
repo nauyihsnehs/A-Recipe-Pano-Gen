@@ -1,7 +1,7 @@
 [paths]
 #input = "inputs/pano_aiypnfgomckrgf.jpg"
-#input = "inputs/starry_night.jpg"
-input = "inputs/symmetrical_garden_02_8k.jpg"
+input = "inputs/starry_night.jpg"
+#input = "inputs/symmetrical_garden_02_8k.jpg"
 output_root = "outputs"
 
 [panorama]
@@ -16,8 +16,8 @@ vertical_fov = 120.0
 
 [models]
 inpaint_model_id = "stabilityai/stable-diffusion-2-inpainting"
-#refine_model_id = "stabilityai/stable-diffusion-2-1-base"
-refine_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+refine_model_id = "stabilityai/stable-diffusion-2-1-base"
+#refine_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 
 [vlm]
 base_url = "http://127.0.0.1:11435/v1"

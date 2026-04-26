@@ -15,39 +15,27 @@ from pipeline_helper import (
     TomlConfigLoader,
 )
 
+REQUIRED_CONFIG = [
+    ("paths", ("input", "output_root")),
+    ("panorama", ("width", "height", "input_fov_x")),
+    ("view", ("size", "middle_fov", "vertical_fov")),
+    ("models", ("inpaint_model_id", "refine_model_id")),
+    ("vlm", ("base_url", "model", "api_key")),
+    ("prompting", ("mode",)),
+    ("synthesis", ("seed", "num_steps", "guidance_scale", "mask_dilate_kernel", "mask_dilate_iterations", "overlap_blend")),
+    ("refinement", ("enabled", "steps", "guidance_scale", "denoise_strength")),
+]
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="End-to-end A Recipe panorama reproduction pipeline."
-    )
+    parser = argparse.ArgumentParser(description="End-to-end A Recipe panorama reproduction pipeline.")
     parser.add_argument("--config", default="pipeline.toml", help="Pipeline TOML config path.")
 
     return parser.parse_args()
 
 
 def validate_config(config):
-    required = [
-        ("paths", ["input", "output_root"]),
-        ("panorama", ["width", "height", "input_fov_x"]),
-        ("view", ["size", "middle_fov", "vertical_fov"]),
-        ("models", ["inpaint_model_id", "refine_model_id"]),
-        ("vlm", ["base_url", "model", "api_key"]),
-        ("prompting", ["mode"]),
-        (
-            "synthesis",
-            [
-                "seed",
-                "num_steps",
-                "guidance_scale",
-                "mask_dilate_kernel",
-                "mask_dilate_iterations",
-                "overlap_blend",
-            ],
-        ),
-        ("refinement", ["enabled", "steps", "guidance_scale", "denoise_strength"]),
-    ]
-
-    for section, keys in required:
+    for section, keys in REQUIRED_CONFIG:
         if section not in config:
             raise KeyError("missing config section: " + section)
         for key in keys:
@@ -68,20 +56,11 @@ def resolve_prompts(config, prompt_tools, debug_dir):
 
     if prompt_mode == "caption":
         caption_prompt = prompt_tools.generate_caption_prompt(paths["input"], vlm_config)
-        prompts = prompt_tools.effective_prompts_for_mode(
-            prompt_mode,
-            caption_prompt=caption_prompt,
-        )
+        prompts = prompt_tools.effective_prompts_for_mode(prompt_mode, caption_prompt=caption_prompt)
         payload["caption_prompt"] = caption_prompt
     else:
-        directional_prompts = prompt_tools.generate_panorama_prompts(
-            paths["input"],
-            vlm_config,
-        )
-        prompts = prompt_tools.effective_prompts_for_mode(
-            prompt_mode,
-            directional_prompts=directional_prompts,
-        )
+        directional_prompts = prompt_tools.generate_panorama_prompts(paths["input"], vlm_config)
+        prompts = prompt_tools.effective_prompts_for_mode(prompt_mode, directional_prompts=directional_prompts)
         payload["directional_prompts"] = directional_prompts
 
     payload["effective_prompts"] = prompts
@@ -102,22 +81,17 @@ def save_anchored_synthesis_outputs(
         pano_size,
         records,
 ):
-    input_mask = AnchoredSynthesizer.initialize(
-        input_image,
-        input_fov_x,
-        input_fov_y,
-        pano_size,
-    )[2]
+    input_mask = AnchoredSynthesizer.initialize(input_image, input_fov_x, input_fov_y, pano_size)[2]
     generated_mask = GeometryTools.binary_mask(known_mask)
-
-    ImageIO.save_image(debug_dir / "80_generated_mask.png", generated_mask)
-    ImageIO.save_image(debug_dir / "81_input_reference_mask.png", input_mask)
-    ImageIO.save_image(debug_dir / "82_anchored_synthesis_panorama.png", panorama)
-    ImageIO.save_image(debug_dir / "83_anchored_synthesis_known_mask.png", known_mask)
-    ImageIO.save_image(
-        debug_dir / "84_anchored_synthesis_missing_mask.png",
-        GeometryTools.compute_missing_mask(known_mask),
-    )
+    outputs = [
+        ("80_generated_mask.png", generated_mask),
+        ("81_input_reference_mask.png", input_mask),
+        ("82_anchored_synthesis_panorama.png", panorama),
+        ("83_anchored_synthesis_known_mask.png", known_mask),
+        ("84_anchored_synthesis_missing_mask.png", GeometryTools.compute_missing_mask(known_mask)),
+    ]
+    for name, image in outputs:
+        ImageIO.save_image(debug_dir / name, image)
     ImageIO.save_json(debug_dir / "records.json", records)
 
     return generated_mask, np.zeros_like(input_mask)
@@ -201,25 +175,9 @@ def main():
         debug_writer=anchored_synthesis_debug_writer,
     )
     generated_mask, refine_protect_mask = save_anchored_synthesis_outputs(
-        debug_dir,
-        panorama,
-        known_mask,
-        input_image,
-        input_fov_x,
-        input_fov_y,
-        pano_size,
-        anchored_synthesis_records,
+        debug_dir, panorama, known_mask, input_image, input_fov_x, input_fov_y, pano_size, anchored_synthesis_records,
     )
-
-    final_panorama, refinement_records = run_refinement(
-        config,
-        debug_dir,
-        panorama,
-        generated_mask,
-        refine_protect_mask,
-        global_prompt,
-        negative_prompt,
-    )
+    final_panorama, refinement_records = run_refinement(config, debug_dir, panorama, generated_mask, refine_protect_mask, global_prompt, negative_prompt)
 
     ImageIO.save_image(output_path, final_panorama)
     ImageIO.save_image(debug_dir / "99_final_pano.png", final_panorama)

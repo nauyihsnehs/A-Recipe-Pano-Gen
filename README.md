@@ -1,5 +1,7 @@
 # A-Recipe-Pano-Gen
 
+> ⚠️ **Note**: This codebase was written with the assistance of **Codex**.
+
 Unofficial implementation of the panorama-generation part of:
 
 **A Recipe for Generating 3D Worlds From a Single Image**
@@ -7,219 +9,91 @@ Unofficial implementation of the panorama-generation part of:
 - Paper: [arXiv:2503.16611](https://arxiv.org/abs/2503.16611)
 - Project page: [katjaschwarz.github.io/worlds](https://katjaschwarz.github.io/worlds/)
 
-This repo currently implements a partial reproduction of Section 3.1, panorama generation. It does not implement the paper's point-cloud-conditioned inpainting, 3D Gaussian Splatting reconstruction, or VR scene export.
+This repo currently implements a partial reproduction of Section 3.1, panorama generation.
 
-## Status
+### Example Outputs
 
-Implemented:
-
-- Perspective image projection into a 2:1 equirectangular panorama.
-- Perspective rendering from an equirectangular panorama.
-- Anchored panorama synthesis:
-  - front input projection,
-  - temporary backside anchor,
-  - front/back top and bottom generation,
-  - anchor removal,
-  - 8-view horizontal sweep,
-  - final panorama stitching from completed inpainted views.
-- VLM-generated directional prompts:
-  - global atmosphere,
-  - sky or ceiling,
-  - ground or floor,
-  - negative prompt.
-- Configurable prompt modes:
-  - `directional` default,
-  - `coarse`,
-  - `caption`.
-- Hard inpainting masks with configurable dilation for main synthesis.
-- Conservative overlap blending for generated regions.
-- Shared stage-level Diffusers generator seeded once per synthesis/refinement stage.
-- Public Diffusers inpainting backend.
-- Optional partial-denoising refinement backend.
-- Debug artifacts for masks, views, projected updates, prompts, and final outputs.
-
-Known differences from the paper:
-
-- Dust3R FoV estimation is not implemented. `input_fov_x` is configured manually.
-- The proprietary T2I inpainting model with ControlNet conditioning is replaced with a public Diffusers model.
-- Default view size is `512`, while the paper uses `1024` px square inpainting views.
-- Default panorama size is `2048x1024`, while paper-scale output is `4096x2048`.
-- Ad-hoc and sequential panorama baselines are not implemented.
-- Florence-2 is not implemented; the optional `caption` prompt mode uses the configured VLM endpoint.
-- The 3D world stages are not implemented.
-- Quantitative experiments and paper baselines are not implemented.
-
-See [reproduction-report.md](reproduction-report.md) for the full alignment review.
+| Input                             | Inpainting                             | Refine                                |
+|-----------------------------------|----------------------------------------|---------------------------------------|
+| ![Input](examples/pers-input.jpg) | ![Panorama](examples/pano-inpaint.jpg) | ![Panorama](examples/pano-refine.jpg) |
 
 ## File And Directory Overview
 
 ```text
-.
-├── inputs/                         # Local input images, ignored by git
-├── outputs/                        # Timestamped runs and debug artifacts, ignored by git
-├── A_Recipe_for_Generating_3D_Worlds_from_a_Single_Image_ICCV_2025.pdf
+.                   
 ├── pipeline.py                     # CLI orchestration
 ├── pipeline_helper.py              # Geometry, scheduling, model backends, prompts, debug writing
 ├── pipeline.toml                   # Default local runtime config
-├── reproduction-concept.md          # Earlier method notes
-├── reproduction-plan.md             # Earlier staged reproduction plan
-├── reproduction-report.md           # Current paper alignment report
 └── README.md
 ```
 
 ## Requirements
 
-Use the existing conda environment:
-
 ```text
-D:\_conda_envs\prmcam
+python==3.10.20
+numpy==1.26.4
+Pillow==9.5.0
+opencv-python==4.10.0.84
+torch==2.5.1+cu118
+diffusers==0.35.1
+tomli==2.4.1
+openai==1.97.1
 ```
-
-Main Python dependencies used by the current code:
-
-```text
-numpy
-Pillow
-opencv-python
-torch
-diffusers
-openai
-```
-
-CUDA is required by the Diffusers backends. Model loading first tries `variant="fp16"` and falls back to loading without the variant.
 
 ## Inference
 
-Run with the default config:
-
-```powershell
-& 'D:\_conda_envs\prmcam\python.exe' pipeline.py
+```bash
+python pipeline.py [--config pipeline.toml]
 ```
 
-Run with an explicit config path:
+## Configs
 
-```powershell
-& 'D:\_conda_envs\prmcam\python.exe' pipeline.py --config pipeline.toml
-```
+| Section      | Key                      | Description                                                      |
+|--------------|--------------------------|------------------------------------------------------------------|
+| `paths`      | `input`                  | Input perspective image path.                                    |
+| `paths`      | `output_root`            | Folder where timestamped output runs are written.                |
+| `panorama`   | `width`                  | Output equirectangular panorama width. Must be 2x `height`.      |
+| `panorama`   | `height`                 | Output equirectangular panorama height.                          |
+| `panorama`   | `input_fov_x`            | Horizontal field of view, in degrees, for the input image.       |
+| `view`       | `size`                   | Square perspective view size used for generation and refinement. |
+| `view`       | `middle_fov`             | Field of view for horizontal panorama views.                     |
+| `view`       | `vertical_fov`           | Field of view for top and bottom views.                          |
+| `models`     | `inpaint_model_id`       | Diffusers inpainting model id.                                   |
+| `models`     | `refine_model_id`        | Diffusers image-to-image refinement model id.                    |
+| `vlm`        | `base_url`               | OpenAI-compatible VLM endpoint.                                  |
+| `vlm`        | `model`                  | VLM model name.                                                  |
+| `vlm`        | `api_key`                | API key for the VLM endpoint.                                    |
+| `prompting`  | `mode`                   | `directional`, `coarse`, or `caption`.                           |
+| `synthesis`  | `seed`                   | Seed for inpainting generation.                                  |
+| `synthesis`  | `num_steps`              | Inpainting inference step count.                                 |
+| `synthesis`  | `guidance_scale`         | Inpainting classifier-free guidance scale.                       |
+| `synthesis`  | `mask_dilate_kernel`     | Kernel size for inpaint mask dilation.                           |
+| `synthesis`  | `mask_dilate_iterations` | Number of mask dilation iterations.                              |
+| `synthesis`  | `overlap_blend`          | Blend generated overlap regions when stitching views.            |
+| `refinement` | `enabled`                | Enable or skip final img2img panorama refinement.                |
+| `refinement` | `steps`                  | Refinement inference step count.                                 |
+| `refinement` | `guidance_scale`         | Refinement classifier-free guidance scale.                       |
+| `refinement` | `denoise_strength`       | Img2img denoise strength for refinement.                         |
 
-Each run writes a timestamped directory under `outputs/`.
+Optional `vlm` keys:
 
-Final panorama:
+- `http_referer`: sent as `HTTP-Referer` when non-empty.
+- `title`: sent as `X-OpenRouter-Title` when non-empty.
 
-```text
-outputs/YYYYmmdd_HHMMSS/<input_name>_pano.png
-```
+Prompt modes:
 
-Debug directory:
-
-```text
-outputs/YYYYmmdd_HHMMSS/debug/
-```
-
-## Config
-
-The pipeline reads TOML from `pipeline.toml`.
-
-Top-level sections:
-
-- `paths`: input image and output root.
-- `panorama`: equirectangular output size and input horizontal FoV.
-- `view`: rendered perspective view size and stage FoVs.
-- `models`: Diffusers model ids for inpainting and refinement.
-- `vlm`: OpenAI-compatible VLM endpoint and model settings.
-- `prompting`: prompt mode, one of `directional`, `coarse`, or `caption`.
-- `synthesis`: seed, inpainting step count, guidance scale, mask dilation, and overlap blending.
-- `refinement`: optional img2img refinement settings.
-
-Current default local settings:
-
-```text
-input: inputs/starry_night.jpg
-panorama: 2048x1024
-view size: 512
-input fov_x: 70.0
-middle fov: 85.0
-vertical fov: 120.0
-top/bottom pitch: +/- 45.0
-inpainting model: stabilityai/stable-diffusion-2-inpainting
-refinement model: stabilityai/stable-diffusion-2-1-base
-VLM endpoint: http://127.0.0.1:11435/v1
-VLM model: qwen3.6
-prompt mode: directional
-synthesis mask dilation: 5 px kernel, 1 iteration
-overlap blending: true
-```
-
-## Debug Outputs
-
-Prompt generation runs on every pipeline run and writes:
-
-```text
-debug/prompts.json
-```
-
-Anchored synthesis writes files under:
-
-```text
-debug/anchored/
-```
-
-Main debug artifacts include:
-
-- initial front/back anchor panorama,
-- stage snapshots after front/back vertical views and horizontal views,
-- known masks and missing masks,
-- per-view stitch images under `debug/anchored/stitches/`,
-- final stage-3 panorama,
-- generated mask,
-- input preserve mask,
-- final panorama.
-
-Each anchored stitch is named by execution order, phase, yaw, and pitch, for example:
-
-```text
-debug/anchored/stitches/00_top_yaw_000_pitch_p045.png
-```
-
-Anchored synthesis order:
-
-```text
-0-3:  top 0, top 180, bottom 0, bottom 180
-4-11: horizontal 22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5
-```
-
-Anchored stitch panels are written in this order:
-
-```text
-rendered_view, view_known_mask, raw_inpaint_mask,
-inpaint_mask, masked_view,
-inpainted_view, projected_update, projected_update_mask,
-projected_blend_mask, updated_panorama, updated_known_mask,
-stitch_update, stitch_update_mask, stitch_blend_mask,
-stitched_panorama, stitched_known_mask
-```
-
-When refinement is enabled, per-view refinement artifacts are written under:
-
-```text
-debug/refinement_stitches/
-```
-
-Refinement stitch panels are written in this order:
-
-```text
-source_view, refine_mask, refined_view,
-blended_view, projected_update, projected_update_mask,
-updated_panorama
-```
+- `directional`: uses separate global, sky/ceiling, ground/floor, and negative prompts from the VLM.
+- `coarse`: uses the VLM global prompt for all panorama directions.
+- `caption`: asks the VLM for one caption and uses it as the generation prompt.
 
 ## Citation
 
 ```bibtex
-@article{schwarz2025recipe,
-  title={A Recipe for Generating 3D Worlds From a Single Image},
-  author={Schwarz, Katja and Rozumnyi, Denys and Rota Bulo, Samuel and Porzi, Lorenzo and Kontschieder, Peter},
-  journal={arXiv preprint arXiv:2503.16611},
+@inproceedings{schwarz2025recipe,
+  title={A recipe for generating 3d worlds from a single image},
+  author={Schwarz, Katja and Rozumny, Denis and Bul{\`o}, Samuel Rota and Porzi, Lorenzo and Kontschieder, Peter},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  pages={3520--3530},
   year={2025}
 }
 ```
