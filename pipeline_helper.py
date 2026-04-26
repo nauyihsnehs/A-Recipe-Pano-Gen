@@ -358,8 +358,8 @@ class GeometryTools:
         return GeometryTools.binary_mask(np.where(footprint > 0, projected, 0))
 
     @staticmethod
-    def _render_perspective_impl(data, yaw, pitch, fov_x, fov_y, out_size, interpolation):
-        out_width, out_height = GeometryTools._parse_size(out_size)
+    def _render_perspective_impl(data, yaw, pitch, fov_x, fov_y, view_render_size, interpolation):
+        out_width, out_height = GeometryTools._parse_size(view_render_size)
         pano_height, pano_width = data.shape[:2]
         fov_x, fov_y = GeometryTools._check_fov(fov_x, fov_y)
         rays = GeometryTools._perspective_rays(out_width, out_height, fov_x, fov_y)
@@ -371,15 +371,37 @@ class GeometryTools:
         map_y = ((math.pi * 0.5 - latitude) / math.pi) * pano_height - 0.5
         map_x = np.mod(map_x, pano_width).astype(np.float32)
         map_y = np.clip(map_y, 0.0, pano_height - 1).astype(np.float32)
-        return cv2.remap(data, map_x, map_y, interpolation=interpolation, borderMode=cv2.BORDER_WRAP)
+        return cv2.remap(
+            data,
+            map_x,
+            map_y,
+            interpolation=interpolation,
+            borderMode=cv2.BORDER_WRAP,
+        )
 
     @staticmethod
-    def render_perspective_from_equirect(panorama, yaw, pitch, fov_x, fov_y, out_size):
-        return GeometryTools._render_perspective_impl(panorama, yaw, pitch, fov_x, fov_y, out_size, cv2.INTER_LINEAR)
+    def render_perspective_from_equirect(panorama, yaw, pitch, fov_x, fov_y, view_render_size):
+        return GeometryTools._render_perspective_impl(
+            panorama,
+            yaw,
+            pitch,
+            fov_x,
+            fov_y,
+            view_render_size,
+            cv2.INTER_LINEAR,
+        )
 
     @staticmethod
-    def render_perspective_mask_from_equirect(mask, yaw, pitch, fov_x, fov_y, out_size):
-        return GeometryTools._render_perspective_impl(mask, yaw, pitch, fov_x, fov_y, out_size, cv2.INTER_NEAREST)
+    def render_perspective_mask_from_equirect(mask, yaw, pitch, fov_x, fov_y, view_render_size):
+        return GeometryTools._render_perspective_impl(
+            mask,
+            yaw,
+            pitch,
+            fov_x,
+            fov_y,
+            view_render_size,
+            cv2.INTER_NEAREST,
+        )
 
 
 class ViewSchedule:
@@ -522,9 +544,9 @@ class DiffusersInpaintingBackend(DiffusersBackendBase):
 
 class DiffusersImg2ImgRefinementBackend(DiffusersBackendBase):
     def __init__(self, model_id):
-        from diffusers import StableDiffusionImg2ImgPipeline
+        from diffusers import DiffusionPipeline
         super().__init__(model_id)
-        self.pipeline_class = StableDiffusionImg2ImgPipeline
+        self.pipeline_class = DiffusionPipeline
 
     def __call__(
             self,
@@ -734,12 +756,12 @@ class AnchoredSynthesizer:
             protect_mask,
             overlap_blend,
     ):
-        out_size = (view_size, view_size)
+        view_render_size = (view_size, view_size)
         rendered_view = GeometryTools.render_perspective_from_equirect(
-            panorama, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size,
+            panorama, view.yaw, view.pitch, view.fov_x, view.fov_y, view_render_size,
         )
         view_known_mask = GeometryTools.render_perspective_mask_from_equirect(
-            known_mask, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size,
+            known_mask, view.yaw, view.pitch, view.fov_x, view.fov_y, view_render_size,
         )
         raw_inpaint_mask = GeometryTools.compute_missing_mask(view_known_mask)
         inpaint_mask = GeometryTools.dilate_mask(
@@ -886,9 +908,9 @@ class AnchoredSynthesizer:
             (
                 stitched_panorama,
                 stitched_known_mask,
-                stitch_update,
-                stitch_update_mask,
-                stitch_blend_mask,
+                stitched_view_update,
+                stitched_view_update_mask,
+                stitched_view_blend_mask,
             ) = PanoramaUpdater.update_with_view(
                 stitched_panorama,
                 stitched_known_mask,
@@ -921,9 +943,9 @@ class AnchoredSynthesizer:
             records.append(record)
 
             debug_images.update(
-                stitch_update=stitch_update,
-                stitch_update_mask=stitch_update_mask,
-                stitch_blend_mask=stitch_blend_mask,
+                stitched_view_update=stitched_view_update,
+                stitched_view_update_mask=stitched_view_update_mask,
+                stitched_view_blend_mask=stitched_view_blend_mask,
                 stitched_panorama=stitched_panorama,
                 stitched_known_mask=stitched_known_mask,
             )
@@ -1005,9 +1027,23 @@ class PanoramaRefiner:
             generator = backend.make_generator(generator_seed)
 
         for index, view in enumerate(schedule):
-            out_size = (view_size, view_size)
-            view_generated_mask = GeometryTools.render_perspective_mask_from_equirect(generated_mask, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size)
-            view_protect_mask = GeometryTools.render_perspective_mask_from_equirect(protect_mask, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size)
+            view_render_size = (view_size, view_size)
+            view_generated_mask = GeometryTools.render_perspective_mask_from_equirect(
+                generated_mask,
+                view.yaw,
+                view.pitch,
+                view.fov_x,
+                view.fov_y,
+                view_render_size,
+            )
+            view_protect_mask = GeometryTools.render_perspective_mask_from_equirect(
+                protect_mask,
+                view.yaw,
+                view.pitch,
+                view.fov_x,
+                view.fov_y,
+                view_render_size,
+            )
             refine_mask = np.where((view_generated_mask > 0) & (view_protect_mask == 0), 255, 0).astype(np.uint8)
             pixel_count = int(np.count_nonzero(refine_mask))
             record = {
@@ -1024,7 +1060,14 @@ class PanoramaRefiner:
                 records.append(record)
                 continue
 
-            source_view = GeometryTools.render_perspective_from_equirect(refined, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size)
+            source_view = GeometryTools.render_perspective_from_equirect(
+                refined,
+                view.yaw,
+                view.pitch,
+                view.fov_x,
+                view.fov_y,
+                view_render_size,
+            )
             refined_view = backend(
                 source_view,
                 prompt,
@@ -1203,7 +1246,7 @@ class PromptTools:
         return prompts
 
     @staticmethod
-    def prompts_to_stage3_args(prompts):
+    def prompts_to_anchored_synthesis_args(prompts):
         prompts = PromptTools.validate_schema(prompts)
 
         return (
@@ -1437,7 +1480,7 @@ class DebugWriter:
 
         ImageIO.save_image(path, canvas)
 
-    STAGE3_STITCH_PANELS = [
+    ANCHORED_SYNTHESIS_STITCH_PANELS = [
         "rendered_view",
         "view_known_mask",
         "raw_inpaint_mask",
@@ -1449,9 +1492,9 @@ class DebugWriter:
         "projected_blend_mask",
         "updated_panorama",
         "updated_known_mask",
-        "stitch_update",
-        "stitch_update_mask",
-        "stitch_blend_mask",
+        "stitched_view_update",
+        "stitched_view_update_mask",
+        "stitched_view_blend_mask",
         "stitched_panorama",
         "stitched_known_mask",
     ]
@@ -1466,7 +1509,7 @@ class DebugWriter:
         "updated_panorama",
     ]
 
-    STAGE3_EVENTS = {
+    ANCHORED_SYNTHESIS_EVENTS = {
         "initial": [
             ("panorama", "00_initial_front_back_anchor"),
             ("known_mask", "01_initial_known_mask"),
@@ -1495,17 +1538,17 @@ class DebugWriter:
     }
 
     @staticmethod
-    def save_stage3_payload(output_dir, event, payload):
+    def save_anchored_synthesis_payload(output_dir, event, payload):
         if event == "step":
             DebugWriter.save_stitch(
                 output_dir / "stitches" / (DebugWriter.step_name(payload["record"]) + ".png"),
                 payload,
-                DebugWriter.STAGE3_STITCH_PANELS,
+                DebugWriter.ANCHORED_SYNTHESIS_STITCH_PANELS,
             )
             return
 
         output_dir = Path(output_dir)
-        for key, name in DebugWriter.STAGE3_EVENTS.get(event, []):
+        for key, name in DebugWriter.ANCHORED_SYNTHESIS_EVENTS.get(event, []):
             if key in payload:
                 ImageIO.save_image(output_dir / f"{name}.png", payload[key])
 

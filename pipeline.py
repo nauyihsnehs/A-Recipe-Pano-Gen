@@ -89,10 +89,19 @@ def resolve_prompts(config, prompt_tools, debug_dir):
     prompt_tools.save_prompt_payload(prompt_path, payload)
     print("Generated prompts:", prompt_path, "mode:", prompt_mode)
 
-    return prompt_tools.prompts_to_stage3_args(prompts)
+    return prompt_tools.prompts_to_anchored_synthesis_args(prompts)
 
 
-def save_stage3_outputs(debug_dir, panorama, known_mask, input_image, input_fov_x, input_fov_y, pano_size, records):
+def save_anchored_synthesis_outputs(
+        debug_dir,
+        panorama,
+        known_mask,
+        input_image,
+        input_fov_x,
+        input_fov_y,
+        pano_size,
+        records,
+):
     input_mask = AnchoredSynthesizer.initialize(
         input_image,
         input_fov_x,
@@ -103,9 +112,12 @@ def save_stage3_outputs(debug_dir, panorama, known_mask, input_image, input_fov_
 
     ImageIO.save_image(debug_dir / "80_generated_mask.png", generated_mask)
     ImageIO.save_image(debug_dir / "81_input_reference_mask.png", input_mask)
-    ImageIO.save_image(debug_dir / "82_stage3_panorama.png", panorama)
-    ImageIO.save_image(debug_dir / "83_stage3_known_mask.png", known_mask)
-    ImageIO.save_image(debug_dir / "84_stage3_missing_mask.png", GeometryTools.compute_missing_mask(known_mask))
+    ImageIO.save_image(debug_dir / "82_anchored_synthesis_panorama.png", panorama)
+    ImageIO.save_image(debug_dir / "83_anchored_synthesis_known_mask.png", known_mask)
+    ImageIO.save_image(
+        debug_dir / "84_anchored_synthesis_missing_mask.png",
+        GeometryTools.compute_missing_mask(known_mask),
+    )
     ImageIO.save_json(debug_dir / "records.json", records)
 
     return generated_mask, np.zeros_like(input_mask)
@@ -164,10 +176,10 @@ def main():
 
     inpaint_backend = DiffusersInpaintingBackend(model_config["inpaint_model_id"])
 
-    def stage3_debug_writer(event, payload):
-        DebugWriter.save_stage3_payload(debug_dir / "anchored", event, payload)
+    def anchored_synthesis_debug_writer(event, payload):
+        DebugWriter.save_anchored_synthesis_payload(debug_dir / "anchored", event, payload)
 
-    panorama, known_mask, stage3_records = AnchoredSynthesizer.run(
+    panorama, known_mask, anchored_synthesis_records = AnchoredSynthesizer.run(
         input_image,
         input_fov_x,
         input_fov_y,
@@ -186,9 +198,9 @@ def main():
         view_size=view_config["size"],
         middle_fov=view_config["middle_fov"],
         vertical_fov=view_config["vertical_fov"],
-        debug_writer=stage3_debug_writer,
+        debug_writer=anchored_synthesis_debug_writer,
     )
-    generated_mask, refine_protect_mask = save_stage3_outputs(
+    generated_mask, refine_protect_mask = save_anchored_synthesis_outputs(
         debug_dir,
         panorama,
         known_mask,
@@ -196,7 +208,7 @@ def main():
         input_fov_x,
         input_fov_y,
         pano_size,
-        stage3_records,
+        anchored_synthesis_records,
     )
 
     final_panorama, refinement_records = run_refinement(
@@ -214,7 +226,7 @@ def main():
     print("Output folder:", run_dir)
     print("Final panorama written to", output_path)
     print("Debug artifacts written to", debug_dir)
-    print("stage3 views:", len(stage3_records))
+    print("anchored synthesis views:", len(anchored_synthesis_records))
     print("refinement records:", len(refinement_records))
 
 

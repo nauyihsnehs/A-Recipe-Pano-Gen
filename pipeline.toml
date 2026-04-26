@@ -16,7 +16,8 @@ vertical_fov = 120.0
 
 [models]
 inpaint_model_id = "stabilityai/stable-diffusion-2-inpainting"
-refine_model_id = "stabilityai/stable-diffusion-2-1-base"
+#refine_model_id = "stabilityai/stable-diffusion-2-1-base"
+refine_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 
 [vlm]
 base_url = "http://127.0.0.1:11435/v1"
@@ -30,7 +31,7 @@ mode = "directional"
 
 [synthesis]
 seed = 42
-num_steps = 40
+num_steps = 50
 guidance_scale = 7.5
 mask_dilate_kernel = 5
 mask_dilate_iterations = 1
@@ -38,6 +39,6 @@ overlap_blend = true
 
 [refinement]
 enabled = true
-steps = 30
+steps = 50
 guidance_scale = 7.5
 denoise_strength = 0.3
