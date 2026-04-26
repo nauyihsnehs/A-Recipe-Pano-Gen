@@ -4,9 +4,9 @@ import json
 import math
 import mimetypes
 import re
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -59,8 +59,13 @@ PROMPT_MODES = ["directional", "coarse", "caption"]
 class TomlConfigLoader:
     @staticmethod
     def load(path):
-        import tomllib
-        return tomllib.load(Path(path))
+        try:
+            import tomllib as toml_reader
+        except ModuleNotFoundError:
+            import tomli as toml_reader
+
+        with Path(path).open("rb") as handle:
+            return toml_reader.load(handle)
 
 
 class ImageIO:
@@ -157,8 +162,12 @@ class GeometryTools:
         return np.where(known_mask > 0, 0, 255).astype(np.uint8)
 
     @staticmethod
+    def binary_mask(mask):
+        return np.where(mask > 0, 255, 0).astype(np.uint8)
+
+    @staticmethod
     def dilate_mask(mask, kernel_size, iterations):
-        mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+        mask = GeometryTools.binary_mask(mask)
         kernel_size = int(kernel_size)
         iterations = int(iterations)
 
@@ -296,9 +305,9 @@ class GeometryTools:
         return map_x, map_y, valid
 
     @staticmethod
-    def project_perspective_to_equirect(image, fov_x, fov_y, yaw, pitch, pano_size):
+    def _project_perspective(data, fov_x, fov_y, yaw, pitch, pano_size, interpolation):
         pano_width, pano_height = GeometryTools._parse_size(pano_size)
-        src_height, src_width = image.shape[:2]
+        src_height, src_width = data.shape[:2]
 
         if pano_width != pano_height * 2:
             raise ValueError("pano_size must use a 2:1 width:height ratio")
@@ -310,40 +319,43 @@ class GeometryTools:
         map_y = np.where(valid, map_y, 0.0).astype(np.float32)
 
         projected = cv2.remap(
-            image, map_x, map_y,
-            interpolation=cv2.INTER_LINEAR,
+            data,
+            map_x,
+            map_y,
+            interpolation=interpolation,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
         )
-        projection_mask = np.where(valid, 255, 0).astype(np.uint8)
-        projected[projection_mask == 0] = 0
+        footprint = np.where(valid, 255, 0).astype(np.uint8)
+        projected[footprint == 0] = 0
 
-        return projected, projection_mask
+        return projected, footprint
+
+    @staticmethod
+    def project_perspective_to_equirect(image, fov_x, fov_y, yaw, pitch, pano_size):
+        return GeometryTools._project_perspective(
+            image,
+            fov_x,
+            fov_y,
+            yaw,
+            pitch,
+            pano_size,
+            cv2.INTER_LINEAR,
+        )
 
     @staticmethod
     def project_perspective_mask_to_equirect(mask, fov_x, fov_y, yaw, pitch, pano_size):
-        pano_width, pano_height = GeometryTools._parse_size(pano_size)
-        src_height, src_width = mask.shape[:2]
-
-        if pano_width != pano_height * 2:
-            raise ValueError("pano_size must use a 2:1 width:height ratio")
-
-        map_x, map_y, valid = GeometryTools._compute_projection_maps(
-            pano_width, pano_height, src_width, src_height, fov_x, fov_y, yaw, pitch
+        projected, footprint = GeometryTools._project_perspective(
+            mask,
+            fov_x,
+            fov_y,
+            yaw,
+            pitch,
+            pano_size,
+            cv2.INTER_NEAREST,
         )
-        map_x = np.where(valid, map_x, 0.0).astype(np.float32)
-        map_y = np.where(valid, map_y, 0.0).astype(np.float32)
 
-        projected = cv2.remap(
-            mask, map_x, map_y,
-            interpolation=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-        projection_mask = np.where(valid, 255, 0).astype(np.uint8)
-        projected = np.where((projected > 0) & (projection_mask > 0), 255, 0).astype(np.uint8)
-
-        return projected
+        return GeometryTools.binary_mask(np.where(footprint > 0, projected, 0))
 
     @staticmethod
     def _render_perspective_impl(data, yaw, pitch, fov_x, fov_y, out_size, interpolation):
@@ -370,16 +382,6 @@ class GeometryTools:
         return GeometryTools._render_perspective_impl(mask, yaw, pitch, fov_x, fov_y, out_size, cv2.INTER_NEAREST)
 
 
-@dataclass
-class View:
-    stage: str
-    phase: str
-    yaw: float
-    pitch: float
-    fov_x: float
-    fov_y: float
-
-
 class ViewSchedule:
     @staticmethod
     def anchored(middle_fov, vertical_fov):
@@ -393,10 +395,28 @@ class ViewSchedule:
             ("bottom", 0, -vertical_pitch),
             ("bottom", 180, -vertical_pitch),
         ]:
-            views.append(View(stage="front_back_vertical", phase=phase, yaw=float(yaw), pitch=pitch, fov_x=vertical_fov, fov_y=vertical_fov))
+            views.append(
+                SimpleNamespace(
+                    stage="front_back_vertical",
+                    phase=phase,
+                    yaw=float(yaw),
+                    pitch=pitch,
+                    fov_x=vertical_fov,
+                    fov_y=vertical_fov,
+                )
+            )
 
         for yaw in np.arange(22.5, 360.0, 45.0):
-            views.append(View(stage="horizontal", phase="horizontal", yaw=float(yaw), pitch=0.0, fov_x=float(middle_fov), fov_y=float(middle_fov)))
+            views.append(
+                SimpleNamespace(
+                    stage="horizontal",
+                    phase="horizontal",
+                    yaw=float(yaw),
+                    pitch=0.0,
+                    fov_x=float(middle_fov),
+                    fov_y=float(middle_fov),
+                )
+            )
 
         return views
 
@@ -461,20 +481,42 @@ class DiffusersInpaintingBackend(DiffusersBackendBase):
         super().__init__(model_id)
         self.pipeline_class = DiffusionPipeline
 
-    def __call__(self, image, mask, prompt, negative_prompt=None, seed=42, generator=None, num_steps=40, guidance_scale=7.5):
+    def __call__(
+            self,
+            image,
+            mask,
+            prompt,
+            negative_prompt=None,
+            seed=42,
+            generator=None,
+            num_steps=40,
+            guidance_scale=7.5,
+    ):
         import torch
-        if self.pipeline is None: self.load()
+
+        if self.pipeline is None:
+            self.load()
+
         image = ImageIO.to_uint8(image)
-        mask = np.clip(mask, 0, 255).astype(np.uint8)
+        mask = GeometryTools.binary_mask(mask)
         image_pil = Image.fromarray(image).convert("RGB")
         mask_pil = Image.fromarray(mask).convert("L")
+
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(int(seed))
+
         result = self.pipeline(
-            prompt=prompt, negative_prompt=negative_prompt, image=image_pil, mask_image=mask_pil,
-            height=image.shape[0], width=image.shape[1], num_inference_steps=int(num_steps),
-            guidance_scale=float(guidance_scale), generator=generator,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=image_pil,
+            mask_image=mask_pil,
+            height=image.shape[0],
+            width=image.shape[1],
+            num_inference_steps=int(num_steps),
+            guidance_scale=float(guidance_scale),
+            generator=generator,
         )
+
         return np.asarray(result.images[0].convert("RGB"))
 
 
@@ -484,18 +526,38 @@ class DiffusersImg2ImgRefinementBackend(DiffusersBackendBase):
         super().__init__(model_id)
         self.pipeline_class = StableDiffusionImg2ImgPipeline
 
-    def __call__(self, image, prompt, negative_prompt=None, seed=42, generator=None, num_steps=30, guidance_scale=7.5, denoise_strength=0.3):
+    def __call__(
+            self,
+            image,
+            prompt,
+            negative_prompt=None,
+            seed=42,
+            generator=None,
+            num_steps=30,
+            guidance_scale=7.5,
+            denoise_strength=0.3,
+    ):
         import torch
-        if self.pipeline is None: self.load()
+
+        if self.pipeline is None:
+            self.load()
+
         image = ImageIO.to_uint8(image)
         image_pil = Image.fromarray(image).convert("RGB")
+
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(int(seed))
+
         result = self.pipeline(
-            prompt=prompt, negative_prompt=negative_prompt or None, image=image_pil,
-            strength=float(denoise_strength), num_inference_steps=int(num_steps),
-            guidance_scale=float(guidance_scale), generator=generator,
+            prompt=prompt,
+            negative_prompt=negative_prompt or None,
+            image=image_pil,
+            strength=float(denoise_strength),
+            num_inference_steps=int(num_steps),
+            guidance_scale=float(guidance_scale),
+            generator=generator,
         )
+
         return np.asarray(result.images[0].convert("RGB"))
 
 
@@ -538,7 +600,7 @@ class PanoramaUpdater:
         if protect_mask is None:
             protect_mask = np.zeros_like(known_mask)
         else:
-            protect_mask = np.where(protect_mask > 0, 255, 0).astype(np.uint8)
+            protect_mask = GeometryTools.binary_mask(protect_mask)
 
         projected_update_mask = np.where(
             (projected_mask > 0)
@@ -616,8 +678,8 @@ class AnchoredSynthesizer:
             anchor_mask,
         )
 
-        input_mask = np.where(input_mask > 0, 255, 0).astype(np.uint8)
-        anchor_mask = np.where(anchor_mask > 0, 255, 0).astype(np.uint8)
+        input_mask = GeometryTools.binary_mask(input_mask)
+        anchor_mask = GeometryTools.binary_mask(anchor_mask)
 
         return panorama, known_mask, input_mask, anchor_mask
 
@@ -684,7 +746,16 @@ class AnchoredSynthesizer:
             raw_inpaint_mask, mask_dilate_kernel, mask_dilate_iterations,
         )
         masked_view = AnchoredSynthesizer.make_masked_view(rendered_view, inpaint_mask)
-        inpainted_view = backend(masked_view, inpaint_mask, prompt, negative_prompt=negative_prompt, seed=seed, generator=generator, num_steps=num_steps, guidance_scale=guidance_scale)
+        inpainted_view = backend(
+            masked_view,
+            inpaint_mask,
+            prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            generator=generator,
+            num_steps=num_steps,
+            guidance_scale=guidance_scale,
+        )
         (
             updated_panorama,
             updated_known_mask,
@@ -807,26 +878,65 @@ class AnchoredSynthesizer:
                 protect_mask,
                 overlap_blend,
             )
-            stitch_mask = np.full(debug_images["inpaint_mask"].shape, 255, dtype=np.uint8)
+            stitch_mask = np.full(
+                debug_images["inpaint_mask"].shape,
+                255,
+                dtype=np.uint8,
+            )
             (
-                stitched_panorama, stitched_known_mask,
-                stitch_update, stitch_update_mask, stitch_blend_mask,
+                stitched_panorama,
+                stitched_known_mask,
+                stitch_update,
+                stitch_update_mask,
+                stitch_blend_mask,
             ) = PanoramaUpdater.update_with_view(
-                stitched_panorama, stitched_known_mask, debug_images["inpainted_view"], stitch_mask,
-                view.yaw, view.pitch, view.fov_x, view.fov_y, overlap_blend=overlap_blend,
+                stitched_panorama,
+                stitched_known_mask,
+                debug_images["inpainted_view"],
+                stitch_mask,
+                view.yaw,
+                view.pitch,
+                view.fov_x,
+                view.fov_y,
+                overlap_blend=overlap_blend,
             )
             known_after = int(np.count_nonzero(known_mask))
             stitch_after = int(np.count_nonzero(stitched_known_mask))
-            record = dict(index=index, stage=view.stage, phase=view.phase, yaw=view.yaw, pitch=view.pitch, fov_x=view.fov_x, fov_y=view.fov_y, known_before=known_before, known_after=known_after, known_added=known_after - known_before, stitch_before=stitch_before, stitch_after=stitch_after, stitch_added=stitch_after - stitch_before, prompt=prompt)
+            record = {
+                "index": index,
+                "stage": view.stage,
+                "phase": view.phase,
+                "yaw": view.yaw,
+                "pitch": view.pitch,
+                "fov_x": view.fov_x,
+                "fov_y": view.fov_y,
+                "known_before": known_before,
+                "known_after": known_after,
+                "known_added": known_after - known_before,
+                "stitch_before": stitch_before,
+                "stitch_after": stitch_after,
+                "stitch_added": stitch_after - stitch_before,
+                "prompt": prompt,
+            }
             records.append(record)
 
-            debug_images.update(stitch_update=stitch_update, stitch_update_mask=stitch_update_mask, stitch_blend_mask=stitch_blend_mask, stitched_panorama=stitched_panorama, stitched_known_mask=stitched_known_mask)
+            debug_images.update(
+                stitch_update=stitch_update,
+                stitch_update_mask=stitch_update_mask,
+                stitch_blend_mask=stitch_blend_mask,
+                stitched_panorama=stitched_panorama,
+                stitched_known_mask=stitched_known_mask,
+            )
             payload = debug_images.copy()
             payload["record"] = record
             if debug_writer:
                 debug_writer("step", payload)
 
-            if view.stage == "horizontal" and not horizontal_saved and (index + 1 >= len(schedule) or schedule[index + 1].stage != "horizontal"):
+            last_horizontal_view = (
+                    view.stage == "horizontal"
+                    and (index + 1 >= len(schedule) or schedule[index + 1].stage != "horizontal")
+            )
+            if last_horizontal_view and not horizontal_saved:
                 horizontal_saved = True
                 if debug_writer:
                     debug_writer(
@@ -857,17 +967,9 @@ class PanoramaRefiner:
     @staticmethod
     def project_refined_view(panorama, refined_view, refine_mask, view, protect_mask):
         pano_size = (panorama.shape[1], panorama.shape[0])
-        projected_view, footprint = GeometryTools.project_perspective_to_equirect(
-            refined_view, view.fov_x, view.fov_y, view.yaw, view.pitch, pano_size,
-        )
-        projected_mask = GeometryTools.project_perspective_mask_to_equirect(
-            refine_mask, view.fov_x, view.fov_y, view.yaw, view.pitch, pano_size,
-        )
-        projected_update_mask = np.where(
-            (projected_mask > 0) & (footprint > 0) & (protect_mask == 0),
-            255,
-            0,
-        ).astype(np.uint8)
+        projected_view, footprint = GeometryTools.project_perspective_to_equirect(refined_view, view.fov_x, view.fov_y, view.yaw, view.pitch, pano_size)
+        projected_mask = GeometryTools.project_perspective_mask_to_equirect(refine_mask, view.fov_x, view.fov_y, view.yaw, view.pitch, pano_size)
+        projected_update_mask = np.where((projected_mask > 0) & (footprint > 0) & (protect_mask == 0), 255, 0).astype(np.uint8)
 
         output = panorama.copy()
         projected_update = np.zeros_like(panorama)
@@ -904,15 +1006,9 @@ class PanoramaRefiner:
 
         for index, view in enumerate(schedule):
             out_size = (view_size, view_size)
-            view_generated_mask = GeometryTools.render_perspective_mask_from_equirect(
-                generated_mask, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size,
-            )
-            view_protect_mask = GeometryTools.render_perspective_mask_from_equirect(
-                protect_mask, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size,
-            )
-            refine_mask = np.where(
-                (view_generated_mask > 0) & (view_protect_mask == 0), 255, 0,
-            ).astype(np.uint8)
+            view_generated_mask = GeometryTools.render_perspective_mask_from_equirect(generated_mask, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size)
+            view_protect_mask = GeometryTools.render_perspective_mask_from_equirect(protect_mask, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size)
+            refine_mask = np.where((view_generated_mask > 0) & (view_protect_mask == 0), 255, 0).astype(np.uint8)
             pixel_count = int(np.count_nonzero(refine_mask))
             record = {
                 "index": index,
@@ -928,9 +1024,7 @@ class PanoramaRefiner:
                 records.append(record)
                 continue
 
-            source_view = GeometryTools.render_perspective_from_equirect(
-                refined, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size,
-            )
+            source_view = GeometryTools.render_perspective_from_equirect(refined, view.yaw, view.pitch, view.fov_x, view.fov_y, out_size)
             refined_view = backend(
                 source_view,
                 prompt,
@@ -943,10 +1037,7 @@ class PanoramaRefiner:
             )
             alpha = np.where(refine_mask > 0, 1.0, 0.0).astype(np.float32)
             alpha = alpha[..., None]
-            blended_view = (
-                    refined_view.astype(np.float32) * alpha
-                    + source_view.astype(np.float32) * (1.0 - alpha)
-            ).astype(np.uint8)
+            blended_view = (refined_view.astype(np.float32) * alpha + source_view.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
             refined, projected_update, projected_update_mask = PanoramaRefiner.project_refined_view(
                 refined,
                 blended_view,
@@ -1185,8 +1276,17 @@ class PromptTools:
                 {"type": "image_url", "image_url": {"url": PromptTools.image_to_data_url(image)}},
             ]},
         ]
-        response = PromptTools.create_completion(client, vlm_config["model"], messages, extra_headers=PromptTools.extra_headers(vlm_config), json_mode=True)
-        return PromptTools.validate_schema(PromptTools.extract_json_object(PromptTools.completion_content(response)))
+        response = PromptTools.create_completion(
+            client,
+            vlm_config["model"],
+            messages,
+            extra_headers=PromptTools.extra_headers(vlm_config),
+            json_mode=True,
+        )
+        content = PromptTools.completion_content(response)
+        prompts = PromptTools.extract_json_object(content)
+
+        return PromptTools.validate_schema(prompts)
 
     @staticmethod
     def generate_caption_prompt(image, vlm_config):
@@ -1198,8 +1298,18 @@ class PromptTools:
                 {"type": "image_url", "image_url": {"url": PromptTools.image_to_data_url(image)}},
             ]},
         ]
-        response = PromptTools.create_completion(client, vlm_config["model"], messages, extra_headers=PromptTools.extra_headers(vlm_config))
-        caption = re.sub(r"^```(?:text)?\s*|\s*```$", "", PromptTools.completion_content(response).strip(), flags=re.IGNORECASE).strip()
+        response = PromptTools.create_completion(
+            client,
+            vlm_config["model"],
+            messages,
+            extra_headers=PromptTools.extra_headers(vlm_config),
+        )
+        caption = re.sub(
+            r"^```(?:text)?\s*|\s*```$",
+            "",
+            PromptTools.completion_content(response).strip(),
+            flags=re.IGNORECASE,
+        ).strip()
         if not caption:
             raise ValueError("caption prompt is empty")
         return caption
@@ -1327,6 +1437,35 @@ class DebugWriter:
 
         ImageIO.save_image(path, canvas)
 
+    STAGE3_STITCH_PANELS = [
+        "rendered_view",
+        "view_known_mask",
+        "raw_inpaint_mask",
+        "inpaint_mask",
+        "masked_view",
+        "inpainted_view",
+        "projected_update",
+        "projected_update_mask",
+        "projected_blend_mask",
+        "updated_panorama",
+        "updated_known_mask",
+        "stitch_update",
+        "stitch_update_mask",
+        "stitch_blend_mask",
+        "stitched_panorama",
+        "stitched_known_mask",
+    ]
+
+    REFINEMENT_STITCH_PANELS = [
+        "source_view",
+        "refine_mask",
+        "refined_view",
+        "blended_view",
+        "projected_update",
+        "projected_update_mask",
+        "updated_panorama",
+    ]
+
     STAGE3_EVENTS = {
         "initial": [
             ("panorama", "00_initial_front_back_anchor"),
@@ -1348,13 +1487,20 @@ class DebugWriter:
         ],
     }
 
+    MISSING_MASK_PREFIXES = {
+        "initial": "04",
+        "after_front_back_vertical": "32",
+        "after_horizontal": "52",
+        "final": "92",
+    }
+
     @staticmethod
     def save_stage3_payload(output_dir, event, payload):
         if event == "step":
             DebugWriter.save_stitch(
                 output_dir / "stitches" / (DebugWriter.step_name(payload["record"]) + ".png"),
                 payload,
-                ["rendered_view", "view_known_mask", "raw_inpaint_mask", "inpaint_mask", "masked_view", "inpainted_view", "projected_update", "projected_update_mask", "projected_blend_mask", "updated_panorama", "updated_known_mask", "stitch_update", "stitch_update_mask", "stitch_blend_mask", "stitched_panorama", "stitched_known_mask"],
+                DebugWriter.STAGE3_STITCH_PANELS,
             )
             return
 
@@ -1363,14 +1509,17 @@ class DebugWriter:
             if key in payload:
                 ImageIO.save_image(output_dir / f"{name}.png", payload[key])
 
-        missing = event in ("initial", "after_front_back_vertical", "after_horizontal", "final") and "known_mask" in payload
-        if missing:
-            suffix = {"initial": "04", "after_front_back_vertical": "32", "after_horizontal": "52", "final": "92"}[event]
-            ImageIO.save_image(output_dir / f"{suffix}_missing_mask.png", GeometryTools.compute_missing_mask(payload["known_mask"]))
+        if event in DebugWriter.MISSING_MASK_PREFIXES and "known_mask" in payload:
+            prefix = DebugWriter.MISSING_MASK_PREFIXES[event]
+            missing_mask = GeometryTools.compute_missing_mask(payload["known_mask"])
+            ImageIO.save_image(output_dir / f"{prefix}_missing_mask.png", missing_mask)
 
         if event == "after_horizontal" and "stitched_panorama" in payload:
             ImageIO.save_image(output_dir / "53_after_horizontal_stitched_panorama.png", payload["stitched_panorama"])
-            ImageIO.save_image(output_dir / "54_after_horizontal_stitched_known_mask.png", payload["stitched_known_mask"])
+            ImageIO.save_image(
+                output_dir / "54_after_horizontal_stitched_known_mask.png",
+                payload["stitched_known_mask"],
+            )
         elif event == "final":
             if "context_panorama" in payload:
                 ImageIO.save_image(output_dir / "93_context_panorama.png", payload["context_panorama"])
@@ -1385,15 +1534,7 @@ class DebugWriter:
             DebugWriter.save_stitch(
                 output_dir / "refinement_stitches" / (DebugWriter.step_name(record) + ".png"),
                 payload,
-                [
-                    "source_view",
-                    "refine_mask",
-                    "refined_view",
-                    "blended_view",
-                    "projected_update",
-                    "projected_update_mask",
-                    "updated_panorama",
-                ],
+                DebugWriter.REFINEMENT_STITCH_PANELS,
             )
             return
 

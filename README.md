@@ -6,8 +6,6 @@ Unofficial implementation of the panorama-generation part of:
 
 - Paper: [arXiv:2503.16611](https://arxiv.org/abs/2503.16611)
 - Project page: [katjaschwarz.github.io/worlds](https://katjaschwarz.github.io/worlds/)
-- Local PDF: [A_Recipe_for_Generating_3D_Worlds_from_a_Single_Image_ICCV_2025.pdf](A_Recipe_for_Generating_3D_Worlds_from_a_Single_Image_ICCV_2025.pdf)
-- README structure reference: [PanoFree-Unofficial](https://github.com/nauyihsnehs/PanoFree-Unofficial/blob/main/README.md)
 
 This repo currently implements a partial reproduction of Section 3.1, panorama generation. It does not implement the paper's point-cloud-conditioned inpainting, 3D Gaussian Splatting reconstruction, or VR scene export.
 
